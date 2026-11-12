@@ -1,0 +1,24 @@
+# Secrets / inventari real (NO pujar mai a GitHub)
+servers.yaml
+*.yaml.local
+credentials*
+.env
+.env.*
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.Python
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+
+# macOS / editors
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~

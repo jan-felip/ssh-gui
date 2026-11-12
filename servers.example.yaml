@@ -1,0 +1,31 @@
+# Copia aquest fitxer a servers.yaml i omple les dades reals:
+#   cp servers.example.yaml servers.yaml
+#   chmod 600 servers.yaml
+#
+# Camps:
+#   host      (obligatori) IP o hostname
+#   user      (obligatori) usuari SSH
+#   pass      (opcional)  contrasenya — millor evitar-la; preferible identity
+#   port      (opcional)  port SSH, per defecte 22
+#   identity  (opcional)  ruta a la clau privada (~/.ssh/id_ed25519)
+#   notes     (opcional)  text curt al menú
+
+exemple_lab:
+  host: 192.0.2.10
+  user: deploy
+  pass: "canvia-aixo"
+  port: 22
+  notes: "Exemple amb contrasenya (DOCUMENTACIÓ — no és un servidor real)"
+
+exemple_amb_clau:
+  host: 192.0.2.20
+  user: admin
+  identity: ~/.ssh/id_ed25519
+  port: 22
+  notes: "Exemple amb clau SSH"
+
+# El_meu_servidor:
+#   host: 10.0.0.5
+#   user: jan
+#   identity: ~/.ssh/id_ed25519
+#   notes: "Producció"
