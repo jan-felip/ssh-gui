@@ -1,23 +1,28 @@
 #!/usr/bin/env python3
-"""ssh-gui: menú TUI per connectar ràpidament via SSH des d'un inventari YAML."""
+"""ssh-gui: TUI menu to quickly SSH using a local YAML inventory."""
 
 from __future__ import annotations
 
 import argparse
 import curses
+import locale
 import os
 import shutil
-import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple, Union
+
+try:
+    locale.setlocale(locale.LC_ALL, "")
+except locale.Error:
+    pass
 
 try:
     import yaml
-except ImportError:  # pragma: no cover - entorn trencat
+except ImportError:  # pragma: no cover
     print(
-        "Falta PyYAML. Instal·la el venv del projecte:\n"
+        "PyYAML is missing. Set up the project venv:\n"
         "  python3 -m venv .venv && .venv/bin/pip install PyYAML",
         file=sys.stderr,
     )
@@ -26,6 +31,9 @@ except ImportError:  # pragma: no cover - entorn trencat
 APP_DIR = Path(__file__).resolve().parent
 DEFAULT_CONFIG = APP_DIR / "servers.yaml"
 EXAMPLE_CONFIG = APP_DIR / "servers.example.yaml"
+
+ADD_ACTION = "__add_host__"
+MenuItem = Union[str, "Server"]  # Server or ADD_ACTION
 
 
 @dataclass
@@ -42,6 +50,26 @@ class Server:
     def label(self) -> str:
         return f"{self.name}  ({self.host})"
 
+    def to_yaml_dict(self) -> Dict[str, Any]:
+        data: Dict[str, Any] = {
+            "host": self.host,
+            "user": self.user,
+        }
+        if self.port != 22:
+            data["port"] = self.port
+        if self.password:
+            data["pass"] = self.password
+        if self.identity:
+            # Store with ~ if under home, for readability
+            home = str(Path.home())
+            ident = self.identity
+            if ident.startswith(home + os.sep):
+                ident = "~" + ident[len(home) :]
+            data["identity"] = ident
+        if self.notes:
+            data["notes"] = self.notes
+        return data
+
 
 def expand_path(value: Optional[str]) -> Optional[str]:
     if not value:
@@ -49,29 +77,30 @@ def expand_path(value: Optional[str]) -> Optional[str]:
     return str(Path(value).expanduser())
 
 
-def load_servers(config_path: Path) -> List[Server]:
+def load_raw(config_path: Path) -> Dict[str, Any]:
     if not config_path.is_file():
         raise FileNotFoundError(
-            f"No s'ha trobat {config_path}.\n"
-            f"Copia l'exemple i omple'l:\n"
+            f"Config not found: {config_path}\n"
+            f"Copy the example and fill it in:\n"
             f"  cp {EXAMPLE_CONFIG} {DEFAULT_CONFIG}\n"
             f"  chmod 600 {DEFAULT_CONFIG}"
         )
-
     with config_path.open("r", encoding="utf-8") as fh:
         raw = yaml.safe_load(fh) or {}
-
     if not isinstance(raw, dict):
-        raise ValueError("El YAML ha de ser un mapa de servidors (clau = nom).")
+        raise ValueError("YAML must be a map of servers (key = name).")
+    return raw
 
+
+def parse_servers(raw: Dict[str, Any]) -> List[Server]:
     servers: List[Server] = []
     for name, data in raw.items():
         if not isinstance(data, dict):
-            raise ValueError(f"Entrada invàlida per a '{name}': s'espera un objecte.")
+            raise ValueError(f"Invalid entry for '{name}': expected a mapping.")
         host = data.get("host")
         user = data.get("user")
         if not host or not user:
-            raise ValueError(f"'{name}' necessita 'host' i 'user'.")
+            raise ValueError(f"'{name}' requires 'host' and 'user'.")
         port = int(data.get("port", 22))
         servers.append(
             Server(
@@ -84,49 +113,62 @@ def load_servers(config_path: Path) -> List[Server]:
                 notes=(str(data["notes"]) if data.get("notes") else None),
             )
         )
-
-    if not servers:
-        raise ValueError(f"{config_path} no conté cap servidor.")
     return servers
 
 
+def load_servers(config_path: Path) -> List[Server]:
+    return parse_servers(load_raw(config_path))
+
+
+def save_server(config_path: Path, server: Server) -> None:
+    """Append or update a server entry in the YAML file."""
+    raw: Dict[str, Any] = {}
+    if config_path.is_file():
+        with config_path.open("r", encoding="utf-8") as fh:
+            loaded = yaml.safe_load(fh) or {}
+        if loaded and not isinstance(loaded, dict):
+            raise ValueError("Existing YAML is not a server map; refusing to overwrite.")
+        raw = loaded if isinstance(loaded, dict) else {}
+
+    if server.name in raw:
+        raise ValueError(f"A host named '{server.name}' already exists.")
+
+    raw[server.name] = server.to_yaml_dict()
+
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    with config_path.open("w", encoding="utf-8") as fh:
+        yaml.safe_dump(raw, fh, default_flow_style=False, allow_unicode=True, sort_keys=False)
+    try:
+        os.chmod(config_path, 0o600)
+    except OSError:
+        pass
+
+
 def build_ssh_argv(server: Server) -> List[str]:
-    """Construeix l'argv d'ssh (i sshpass si cal)."""
     ssh: List[str] = ["ssh", "-p", str(server.port)]
     if server.identity:
         ssh.extend(["-i", server.identity])
-    # Preferim clau si hi ha identity; pass només si no n'hi ha o com a fallback explícit
     use_password = bool(server.password) and not server.identity
-    target = f"{server.user}@{server.host}"
-    ssh.append(target)
+    ssh.append(f"{server.user}@{server.host}")
 
-    if use_password:
-        if shutil.which("sshpass"):
-            return ["sshpass", "-p", server.password, *ssh]
-        # Sense sshpass: deixem que ssh demani la contrasenya (no posem -o BatchMode)
-        return ssh
-
-    if server.identity:
-        # Evita demanar pass de clau si no cal; l'usuari pot treure BatchMode si cal
-        return ssh
-
+    if use_password and shutil.which("sshpass"):
+        return ["sshpass", "-p", server.password, *ssh]
     return ssh
 
 
 def describe_auth(server: Server) -> str:
     if server.identity:
-        return f"clau: {server.identity}"
+        return f"key: {server.identity}"
     if server.password:
         if shutil.which("sshpass"):
-            return "contrasenya YAML via sshpass"
-        return "contrasenya YAML (sshpass NO trobat → SSH demanarà el pass)"
-    return "auth interactiva (sense pass ni clau al YAML)"
+            return "YAML password via sshpass"
+        return "YAML password (sshpass NOT found → SSH will prompt)"
+    return "interactive SSH auth (no pass/key in YAML)"
 
 
 def connect(server: Server, dry_run: bool = False) -> int:
     argv = build_ssh_argv(server)
     display = list(argv)
-    # No mostrem la contrasenya en clar a dry-run / logs
     if display and display[0] == "sshpass" and len(display) >= 3 and display[1] == "-p":
         display[2] = "***"
 
@@ -137,109 +179,430 @@ def connect(server: Server, dry_run: bool = False) -> int:
     print(f"  cmd: {' '.join(display)}")
 
     if dry_run:
-        print("(dry-run: no s'ha obert la connexió)")
+        print("(dry-run: connection not opened)")
         return 0
 
     if server.password and not server.identity and not shutil.which("sshpass"):
         print(
-            "\nAvís: tens 'pass' al YAML però 'sshpass' no està instal·lat.\n"
+            "\nWarning: 'pass' is set in YAML but 'sshpass' is not installed.\n"
             "  brew install hudochenkov/sshpass/sshpass\n"
-            "o bé afegeix 'identity: ~/.ssh/id_ed25519' i usa clau.\n"
-            "Mentrestant SSH et demanarà la contrasenya a mà.\n",
+            "or add 'identity: ~/.ssh/id_ed25519' and use a key.\n"
+            "SSH will prompt for the password for now.\n",
             file=sys.stderr,
         )
 
-    # Entrega el control al terminal per a la sessió SSH
     os.execvp(argv[0], argv)
     return 1  # unreachable
 
 
-def menu_select(servers: List[Server]) -> Optional[Server]:
-    def _draw(stdscr: "curses._CursesWindow") -> Optional[Server]:
-        curses.curs_set(0)
-        if curses.has_colors():
-            curses.start_color()
-            curses.use_default_colors()
-            curses.init_pair(1, curses.COLOR_BLACK, curses.COLOR_CYAN)
-            curses.init_pair(2, curses.COLOR_YELLOW, -1)
+def _init_colors() -> None:
+    if not curses.has_colors():
+        return
+    curses.start_color()
+    curses.use_default_colors()
+    curses.init_pair(1, curses.COLOR_BLACK, curses.COLOR_CYAN)  # selected row
+    curses.init_pair(2, curses.COLOR_YELLOW, -1)  # hints
+    curses.init_pair(3, curses.COLOR_GREEN, -1)  # [+]
+    curses.init_pair(4, curses.COLOR_WHITE, -1)  # Add host text
+    curses.init_pair(5, curses.COLOR_GREEN, curses.COLOR_CYAN)  # [+] selected
+    curses.init_pair(6, curses.COLOR_WHITE, curses.COLOR_CYAN)  # Add host selected
+    curses.init_pair(7, curses.COLOR_RED, -1)  # errors
 
+
+def _menu_items(servers: List[Server]) -> List[MenuItem]:
+    items: List[MenuItem] = list(servers)
+    items.append(ADD_ACTION)
+    return items
+
+
+def _draw_add_label(stdscr: "curses._CursesWindow", y: int, w: int, selected: bool) -> None:
+    """Draw '[+] Add host' with green [+] and white remaining text."""
+    prefix = "  "
+    plus = "[+]"
+    rest = " Add host"
+    x = 0
+    if selected:
+        plus_attr = curses.color_pair(5) | curses.A_BOLD
+        rest_attr = curses.color_pair(6) | curses.A_BOLD
+        # Fill selection background across the line
+        try:
+            stdscr.addnstr(y, 0, " " * max(0, w - 1), w - 1, curses.color_pair(1))
+        except curses.error:
+            pass
+    else:
+        plus_attr = curses.color_pair(3) | curses.A_BOLD
+        rest_attr = curses.color_pair(4)
+
+    try:
+        stdscr.addnstr(y, x, prefix[: max(0, w - 1)], w - 1, rest_attr if selected else curses.A_NORMAL)
+        x += len(prefix)
+        if x < w - 1:
+            stdscr.addnstr(y, x, plus[: max(0, w - 1 - x)], w - 1 - x, plus_attr)
+            x += len(plus)
+        if x < w - 1:
+            stdscr.addnstr(y, x, rest[: max(0, w - 1 - x)], w - 1 - x, rest_attr)
+    except curses.error:
+        pass
+
+
+def prompt_field(
+    stdscr: "curses._CursesWindow",
+    y: int,
+    label: str,
+    default: str = "",
+    secret: bool = False,
+) -> Optional[str]:
+    """Single-line field editor. Returns None if cancelled (Esc)."""
+    h, w = stdscr.getmaxyx()
+    curses.curs_set(1)
+    buf = list(default)
+    pos = len(buf)
+    while True:
+        try:
+            stdscr.move(y, 0)
+            stdscr.clrtoeol()
+            shown = ("*" * len(buf)) if secret else "".join(buf)
+            line = f"{label}{shown}"
+            stdscr.addnstr(y, 0, line[: max(0, w - 1)], w - 1)
+            cursor_x = min(len(label) + pos, w - 2)
+            stdscr.move(y, max(0, cursor_x))
+            stdscr.refresh()
+        except curses.error:
+            pass
+
+        key = stdscr.get_wch()
+        if key in ("\n", "\r", curses.KEY_ENTER):
+            curses.curs_set(0)
+            return "".join(buf)
+        if key == "\x1b":  # Esc
+            curses.curs_set(0)
+            return None
+        if key in (curses.KEY_BACKSPACE, "\x7f", "\b"):
+            if pos > 0:
+                del buf[pos - 1]
+                pos -= 1
+        elif key == curses.KEY_LEFT:
+            pos = max(0, pos - 1)
+        elif key == curses.KEY_RIGHT:
+            pos = min(len(buf), pos + 1)
+        elif key == curses.KEY_DC:
+            if pos < len(buf):
+                del buf[pos]
+        elif isinstance(key, str) and key.isprintable():
+            buf.insert(pos, key)
+            pos += 1
+
+
+def add_host_form(stdscr: "curses._CursesWindow", existing_names: set) -> Optional[Server]:
+    """Interactive form to create a new host. Esc cancels."""
+    fields = [
+        ("Name (unique id): ", "", False, True),
+        ("Host (IP/hostname): ", "", False, True),
+        ("User: ", "", False, True),
+        ("Port [22]: ", "22", False, False),
+        ("Password (optional): ", "", True, False),
+        ("Identity key path (optional): ", "", False, False),
+        ("Notes (optional): ", "", False, False),
+    ]
+    values: List[str] = [""] * len(fields)
+
+    while True:
+        stdscr.clear()
+        h, w = stdscr.getmaxyx()
+        title = "Add host  (Enter confirm field · Esc cancel)"
+        stdscr.addnstr(0, 0, title[: max(0, w - 1)], w - 1, curses.A_BOLD)
+        stdscr.addnstr(
+            1,
+            0,
+            "Required: name, host, user. Prefer a key over a password."[: max(0, w - 1)],
+            w - 1,
+            curses.color_pair(2),
+        )
+
+        for i, (label, default, _secret, _req) in enumerate(fields):
+            y = 3 + i
+            if y >= h - 2:
+                break
+            shown = values[i] if values[i] else (default if i != 0 else "")
+            display = ("*" * len(shown)) if _secret and shown else shown
+            stdscr.addnstr(y, 0, f"  {label}{display}"[: max(0, w - 1)], w - 1)
+
+        stdscr.refresh()
+
+        error: Optional[str] = None
+        for i, (label, default, secret, required) in enumerate(fields):
+            y = 3 + i
+            start = values[i] if values[i] else default
+            result = prompt_field(stdscr, y, f"  {label}", start, secret=secret)
+            if result is None:
+                return None
+            values[i] = result.strip()
+
+        name, host, user, port_s, password, identity, notes = values
+        if not name:
+            error = "Name is required."
+        elif name in existing_names:
+            error = f"Name '{name}' already exists."
+        elif not host:
+            error = "Host is required."
+        elif not user:
+            error = "User is required."
+        else:
+            try:
+                port = int(port_s) if port_s else 22
+                if port < 1 or port > 65535:
+                    raise ValueError
+            except ValueError:
+                error = "Port must be a number between 1 and 65535."
+                port = 22
+
+        if error:
+            try:
+                stdscr.addnstr(h - 1, 0, error[: max(0, w - 1)].ljust(w - 1), w - 1, curses.color_pair(7))
+                stdscr.refresh()
+                stdscr.getch()
+            except curses.error:
+                pass
+            continue
+
+        return Server(
+            name=name,
+            host=host,
+            user=user,
+            password=password or None,
+            port=port,
+            identity=expand_path(identity) if identity else None,
+            notes=notes or None,
+        )
+
+
+def menu_loop(config_path: Path, dry_run: bool = False) -> Tuple[str, Optional[Server]]:
+    """
+    Run the TUI. Returns (action, server):
+      ('connect', Server) | ('quit', None)
+    """
+
+    def _run(stdscr: "curses._CursesWindow") -> Tuple[str, Optional[Server]]:
+        curses.curs_set(0)
+        _init_colors()
         idx = 0
+
         while True:
+            try:
+                servers = load_servers(config_path)
+            except FileNotFoundError:
+                # Allow empty/missing: create skeleton so Add host works
+                config_path.write_text("{}\n", encoding="utf-8")
+                os.chmod(config_path, 0o600)
+                servers = []
+            except (ValueError, yaml.YAMLError) as exc:
+                stdscr.clear()
+                stdscr.addstr(0, 0, f"Config error: {exc}")
+                stdscr.addstr(2, 0, "Press any key to quit.")
+                stdscr.getch()
+                return ("quit", None)
+
+            items = _menu_items(servers)
+            # Visual rows: servers, blank separator (if any servers), add action
+            # Navigation index maps over items only (not the blank line)
+
             stdscr.clear()
             h, w = stdscr.getmaxyx()
-            title = "ssh-gui — selecciona un servidor (↑↓ Enter, q surt)"
+            title = "ssh-gui — select a server (↑↓ Enter, q quit)"
             stdscr.addnstr(0, 0, title[: max(0, w - 1)], w - 1, curses.A_BOLD)
-            hint = "Enter = connectar · q = sortir · / no cal"
             if h > 2:
-                stdscr.addnstr(1, 0, hint[: max(0, w - 1)], w - 1, curses.color_pair(2))
+                stdscr.addnstr(
+                    1,
+                    0,
+                    "Enter = connect / add · q = quit"[: max(0, w - 1)],
+                    w - 1,
+                    curses.color_pair(2),
+                )
 
-            visible = max(1, h - 4)
-            start = max(0, min(idx - visible + 1, len(servers) - visible))
-            for row, server in enumerate(servers[start : start + visible]):
-                line = f"  {server.label}"
-                if server.notes:
-                    line += f"  — {server.notes}"
-                y = row + 3
+            # Build display rows: (item_index or None for blank, kind)
+            # kind: 'server' | 'blank' | 'add'
+            display_rows: List[Tuple[Optional[int], str]] = []
+            for i, item in enumerate(items):
+                if item == ADD_ACTION:
+                    if servers:
+                        display_rows.append((None, "blank"))
+                    display_rows.append((i, "add"))
+                else:
+                    display_rows.append((i, "server"))
+
+            # Find which display row corresponds to idx for scrolling
+            focus_row = next(r for r, (ii, _) in enumerate(display_rows) if ii == idx)
+            top_pad = 3
+            visible = max(1, h - top_pad - 1)
+            start_row = max(0, min(focus_row - visible + 1, len(display_rows) - visible))
+
+            for row_i, (item_i, kind) in enumerate(display_rows[start_row : start_row + visible]):
+                y = top_pad + row_i
                 if y >= h:
                     break
-                attr = curses.color_pair(1) | curses.A_BOLD if (start + row) == idx else curses.A_NORMAL
-                stdscr.addnstr(y, 0, line[: max(0, w - 1)].ljust(min(w - 1, len(line) + 2)), w - 1, attr)
+                if kind == "blank":
+                    continue
+                selected = item_i == idx
+                if kind == "add":
+                    _draw_add_label(stdscr, y, w, selected)
+                else:
+                    server = items[item_i]  # type: ignore[index]
+                    assert isinstance(server, Server)
+                    line = f"  {server.label}"
+                    if server.notes:
+                        line += f"  — {server.notes}"
+                    attr = curses.color_pair(1) | curses.A_BOLD if selected else curses.A_NORMAL
+                    try:
+                        stdscr.addnstr(
+                            y,
+                            0,
+                            line[: max(0, w - 1)].ljust(min(w - 1, max(len(line), 2))),
+                            w - 1,
+                            attr,
+                        )
+                    except curses.error:
+                        pass
 
             stdscr.refresh()
             key = stdscr.getch()
+            n = len(items)
             if key in (curses.KEY_UP, ord("k")):
-                idx = (idx - 1) % len(servers)
+                idx = (idx - 1) % n
             elif key in (curses.KEY_DOWN, ord("j")):
-                idx = (idx + 1) % len(servers)
+                idx = (idx + 1) % n
             elif key in (curses.KEY_ENTER, 10, 13):
-                return servers[idx]
+                chosen = items[idx]
+                if chosen == ADD_ACTION:
+                    existing = {s.name for s in servers}
+                    new_server = add_host_form(stdscr, existing)
+                    if new_server is None:
+                        continue
+                    try:
+                        save_server(config_path, new_server)
+                    except ValueError as exc:
+                        stdscr.clear()
+                        stdscr.addstr(0, 0, f"Could not save: {exc}")
+                        stdscr.addstr(2, 0, "Press any key…")
+                        stdscr.getch()
+                        continue
+                    # Stay in menu; select the new host
+                    servers = load_servers(config_path)
+                    items = _menu_items(servers)
+                    for i, it in enumerate(items):
+                        if isinstance(it, Server) and it.name == new_server.name:
+                            idx = i
+                            break
+                    continue
+                assert isinstance(chosen, Server)
+                return ("connect", chosen)
             elif key in (ord("q"), 27):
-                return None
+                return ("quit", None)
 
-    return curses.wrapper(_draw)
+    return curses.wrapper(_run)
 
 
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(
         prog="ssh-gui",
-        description="Menú TUI per connectar per SSH amb inventari YAML local.",
+        description="TUI menu to SSH using a local YAML inventory.",
     )
     p.add_argument(
         "-c",
         "--config",
         type=Path,
         default=DEFAULT_CONFIG,
-        help=f"Fitxer YAML (per defecte: {DEFAULT_CONFIG})",
+        help=f"YAML config file (default: {DEFAULT_CONFIG})",
     )
     p.add_argument(
         "--dry-run",
         action="store_true",
-        help="Mostra la comanda sense executar ssh.",
+        help="Show the command without running ssh.",
     )
     p.add_argument(
         "--list",
         action="store_true",
-        help="Llista servidors i surt (sense TUI).",
+        help="List servers and exit (no TUI).",
     )
     p.add_argument(
         "--connect",
-        metavar="NOM",
-        help="Connecta directament al servidor amb aquest nom (sense menú).",
+        metavar="NAME",
+        help="Connect directly to this server name (no menu).",
+    )
+    p.add_argument(
+        "--add",
+        action="store_true",
+        help="Add a host via prompts (no TUI menu).",
     )
     return p.parse_args(argv)
 
 
-def main(argv: Optional[List[str]] = None) -> int:
-    args = parse_args(argv)
+def add_host_cli(config_path: Path) -> int:
+    """Non-TUI prompts to add a host (for scripting / dry terminals)."""
     try:
-        servers = load_servers(args.config)
-    except (FileNotFoundError, ValueError, yaml.YAMLError) as exc:
+        existing = {s.name for s in load_servers(config_path)} if config_path.is_file() else set()
+    except (ValueError, yaml.YAMLError) as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 1
 
-    by_name: Dict[str, Server] = {s.name: s for s in servers}
+    def ask(label: str, default: str = "") -> str:
+        suffix = f" [{default}]" if default else ""
+        val = input(f"{label}{suffix}: ").strip()
+        return val if val else default
+
+    print("Add host (leave optional fields empty to skip)")
+    name = ask("Name (unique id)")
+    host = ask("Host (IP/hostname)")
+    user = ask("User")
+    port_s = ask("Port", "22")
+    password = ask("Password (optional)")
+    identity = ask("Identity key path (optional)")
+    notes = ask("Notes (optional)")
+
+    if not name or not host or not user:
+        print("Name, host and user are required.", file=sys.stderr)
+        return 1
+    if name in existing:
+        print(f"A host named '{name}' already exists.", file=sys.stderr)
+        return 1
+    try:
+        port = int(port_s)
+    except ValueError:
+        print("Invalid port.", file=sys.stderr)
+        return 1
+
+    server = Server(
+        name=name,
+        host=host,
+        user=user,
+        password=password or None,
+        port=port,
+        identity=expand_path(identity) if identity else None,
+        notes=notes or None,
+    )
+    try:
+        save_server(config_path, server)
+    except ValueError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+    print(f"Saved '{name}' to {config_path}")
+    return 0
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    args = parse_args(argv)
+
+    if args.add:
+        return add_host_cli(args.config)
 
     if args.list:
+        if not args.config.is_file():
+            print(f"Error: config not found: {args.config}", file=sys.stderr)
+            return 1
+        try:
+            servers = load_servers(args.config)
+        except (ValueError, yaml.YAMLError) as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 1
         for s in servers:
             extra = []
             if s.identity:
@@ -252,22 +615,28 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 0
 
     if args.connect:
+        try:
+            servers = load_servers(args.config)
+        except (FileNotFoundError, ValueError, yaml.YAMLError) as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 1
+        by_name = {s.name: s for s in servers}
         server = by_name.get(args.connect)
         if not server:
-            print(f"No existeix el servidor '{args.connect}'.", file=sys.stderr)
+            print(f"Unknown server '{args.connect}'.", file=sys.stderr)
             return 1
         return connect(server, dry_run=args.dry_run)
 
     if not sys.stdin.isatty() or not sys.stdout.isatty():
         print(
-            "No hi ha TTY. Usa --list, --connect NOM o obre un terminal interactiu.",
+            "No TTY. Use --list, --connect NAME, --add, or open an interactive terminal.",
             file=sys.stderr,
         )
         return 1
 
-    chosen = menu_select(servers)
-    if chosen is None:
-        print("Cancel·lat.")
+    action, chosen = menu_loop(args.config, dry_run=args.dry_run)
+    if action == "quit" or chosen is None:
+        print("Cancelled.")
         return 0
     return connect(chosen, dry_run=args.dry_run)
 

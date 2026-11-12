@@ -1,31 +1,33 @@
-# Copia aquest fitxer a servers.yaml i omple les dades reals:
+# Copy to servers.yaml and fill in real values:
 #   cp servers.example.yaml servers.yaml
 #   chmod 600 servers.yaml
 #
-# Camps:
-#   host      (obligatori) IP o hostname
-#   user      (obligatori) usuari SSH
-#   pass      (opcional)  contrasenya — millor evitar-la; preferible identity
-#   port      (opcional)  port SSH, per defecte 22
-#   identity  (opcional)  ruta a la clau privada (~/.ssh/id_ed25519)
-#   notes     (opcional)  text curt al menú
+# Or add hosts from the TUI: select "[+] Add host" at the bottom of the menu.
+#
+# Fields:
+#   host      (required) IP or hostname
+#   user      (required) SSH username
+#   pass      (optional) password — prefer identity when possible
+#   port      (optional) SSH port, default 22
+#   identity  (optional) private key path (~/.ssh/id_ed25519)
+#   notes     (optional) short label shown in the menu
 
-exemple_lab:
+example_lab:
   host: 192.0.2.10
   user: deploy
-  pass: "canvia-aixo"
+  pass: "change-me"
   port: 22
-  notes: "Exemple amb contrasenya (DOCUMENTACIÓ — no és un servidor real)"
+  notes: "Example with password (DOCUMENTATION — not a real server)"
 
-exemple_amb_clau:
+example_with_key:
   host: 192.0.2.20
   user: admin
   identity: ~/.ssh/id_ed25519
   port: 22
-  notes: "Exemple amb clau SSH"
+  notes: "Example with SSH key"
 
-# El_meu_servidor:
+# my_server:
 #   host: 10.0.0.5
 #   user: jan
 #   identity: ~/.ssh/id_ed25519
-#   notes: "Producció"
+#   notes: "Production"

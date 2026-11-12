@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Instal·la/actualitza el venv i enllaça ssh-gui a ~/.local/bin
+# Install/update the venv and symlink ssh-gui into ~/.local/bin
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 BIN_DIR="${HOME}/.local/bin"
@@ -16,7 +16,7 @@ ln -sfn "$ROOT/bin/ssh-gui" "$BIN_DIR/ssh-gui"
 if [[ ! -f "$ROOT/servers.yaml" ]]; then
   cp "$ROOT/servers.example.yaml" "$ROOT/servers.yaml"
   chmod 600 "$ROOT/servers.yaml"
-  echo "Creat $ROOT/servers.yaml (des de l'exemple). Edita'l amb les teves dades."
+  echo "Created $ROOT/servers.yaml (from example). Edit it or use [+] Add host in the TUI."
 else
   chmod 600 "$ROOT/servers.yaml" 2>/dev/null || true
 fi
@@ -24,14 +24,14 @@ fi
 echo "OK: $BIN_DIR/ssh-gui → $ROOT/bin/ssh-gui"
 if ! command -v ssh-gui >/dev/null 2>&1; then
   echo
-  echo "PATH: afegeix això al ~/.zshrc si cal (ja sol estar-hi):"
+  echo "PATH: add this to ~/.zshrc if needed:"
   echo '  export PATH="$HOME/.local/bin:$PATH"'
-  echo "Després: source ~/.zshrc"
+  echo "Then: source ~/.zshrc"
 else
-  echo "Comanda disponible: $(command -v ssh-gui)"
+  echo "Command available: $(command -v ssh-gui)"
 fi
 
 if ! command -v sshpass >/dev/null 2>&1; then
   echo
-  echo "Opcional (contrasenyes YAML): brew install hudochenkov/sshpass/sshpass"
+  echo "Optional (YAML passwords): brew install hudochenkov/sshpass/sshpass"
 fi

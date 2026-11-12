@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Launcher: resol el symlink i executa ssh_gui.py amb el venv del projecte
+# Launcher: resolve symlink and run ssh_gui.py with the project venv
 set -euo pipefail
 
 SOURCE="${BASH_SOURCE[0]}"
@@ -16,8 +16,8 @@ ROOT="$(cd -P "$(dirname "$SOURCE")/.." && pwd)"
 
 PY="$ROOT/.venv/bin/python"
 if [[ ! -x "$PY" ]]; then
-  echo "Falta el venv a $ROOT/.venv" >&2
-  echo "Executa: cd \"$ROOT\" && ./install.sh" >&2
+  echo "Missing venv at $ROOT/.venv" >&2
+  echo "Run: cd \"$ROOT\" && ./install.sh" >&2
   exit 1
 fi
 exec "$PY" "$ROOT/ssh_gui.py" "$@"
