@@ -43,17 +43,20 @@ EXAMPLE_CONFIG = APP_DIR / "servers.example.yaml"
 ADD_ACTION = "__add_host__"
 MenuItem = Union[str, "Server"]  # Server or ADD_ACTION
 
-TITLE_ART = r"""
+TITLE_ART = [
+    "  " + line
+    for line in r"""
               __                      _ 
    __________/ /_        ____ ___  __(_)
   / ___/ ___/ __ \______/ __ `/ / / / / 
  (__  |__  ) / / /_____/ /_/ / /_/ / /  
 /____/____/_/ /_/      \__, /\__,_/_/   
                       /____/            
-""".splitlines()[1:]  # drop leading empty from triple-quote
+""".splitlines()[1:]
+]
 
 SUBTITLE_ART = [
-    "By Walker #61899",
+    "  By Walker #61899",
 ]
 
 # Banner = title + blank + subtitle + blank before list chrome
