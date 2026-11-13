@@ -59,9 +59,12 @@ SUBTITLE_ART = [
     "  By Walker #61899",
 ]
 
-# Banner = title + blank + subtitle + blank before list chrome
-BANNER_LINE_COUNT = len(TITLE_ART) + 1 + len(SUBTITLE_ART) + 1
+# Banner = title + subtitle (no blank between) + blank before list chrome
+BANNER_LINE_COUNT = len(TITLE_ART) + len(SUBTITLE_ART) + 1
 COMPACT_TITLE = "ssh-gui"
+# Spacing between NAME / HOST / NOTES (tripled from the original 2 spaces)
+COL_GAP = "      "  # 6 spaces
+COL_GAP_LEN = len(COL_GAP)
 
 
 @dataclass
@@ -455,16 +458,18 @@ def _fit_cell(text: str, width: int) -> str:
 def _column_widths(servers: List[Server], term_w: int) -> Tuple[int, int, int]:
     """
     Compute name / host / notes column widths for the menu.
-    Leading indent (2) + two gaps (2+2) are reserved outside these widths.
+    Leading indent (2) + two COL_GAP gaps are reserved outside these widths.
     """
-    usable = max(16, term_w - 1 - 2 - 4)  # row budget minus indent/gaps
+    gaps = COL_GAP_LEN * 2
+    usable = max(16, term_w - 1 - 2 - gaps)  # row budget minus indent/gaps
     name_needed = max((len(s.name) for s in servers), default=4)
     host_needed = max((len(s.host) for s in servers), default=4)
     name_w = min(max(name_needed, 8), 24)
     host_w = min(max(host_needed, 12), 32)
-    if name_w + host_w > usable - 8:
+    min_notes = 8
+    if name_w + host_w > usable - min_notes:
         # Shrink proportionally on narrow terminals
-        overflow = name_w + host_w - (usable - 8)
+        overflow = name_w + host_w - (usable - min_notes)
         cut_name = min(name_w - 6, overflow // 2)
         name_w -= max(0, cut_name)
         host_w = max(8, host_w - (overflow - max(0, cut_name)))
@@ -477,8 +482,8 @@ def format_server_row(server: Server, name_w: int, host_w: int, notes_w: int) ->
     host = _fit_cell(server.host, host_w)
     notes = _fit_cell(server.notes or "", notes_w) if notes_w > 0 else ""
     if notes_w > 0:
-        return f"  {name}  {host}  {notes}"
-    return f"  {name}  {host}"
+        return f"  {name}{COL_GAP}{host}{COL_GAP}{notes}"
+    return f"  {name}{COL_GAP}{host}"
 
 
 def format_header_row(name_w: int, host_w: int, notes_w: int) -> str:
@@ -486,8 +491,8 @@ def format_header_row(name_w: int, host_w: int, notes_w: int) -> str:
     host = _fit_cell("HOST", host_w)
     if notes_w > 0:
         notes = _fit_cell("NOTES", notes_w)
-        return f"  {name}  {host}  {notes}"
-    return f"  {name}  {host}"
+        return f"  {name}{COL_GAP}{host}{COL_GAP}{notes}"
+    return f"  {name}{COL_GAP}{host}"
 
 
 def _safe_add(stdscr: "curses._CursesWindow", y: int, x: int, text: str, attr: int = 0) -> None:
@@ -523,7 +528,6 @@ def draw_banner(stdscr: "curses._CursesWindow", term_h: int, term_w: int) -> int
     for line in TITLE_ART:
         _safe_add(stdscr, y, 0, line, title_attr)
         y += 1
-    y += 1  # blank between title and subtitle
     for line in SUBTITLE_ART:
         _safe_add(stdscr, y, 0, line, sub_attr)
         y += 1
