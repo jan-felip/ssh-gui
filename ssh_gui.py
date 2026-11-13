@@ -5,10 +5,18 @@ from __future__ import annotations
 
 import argparse
 import curses
+import errno
+import fcntl
 import locale
 import os
-import shutil
+import re
+import select
+import signal
+import struct
 import sys
+import termios
+import time
+import tty
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -144,52 +152,243 @@ def save_server(config_path: Path, server: Server) -> None:
         pass
 
 
+def uses_yaml_password(server: Server) -> bool:
+    """Use YAML password when set and no identity key is configured."""
+    return bool(server.password) and not server.identity
+
+
 def build_ssh_argv(server: Server) -> List[str]:
     ssh: List[str] = ["ssh", "-p", str(server.port)]
     if server.identity:
         ssh.extend(["-i", server.identity])
-    use_password = bool(server.password) and not server.identity
+    elif uses_yaml_password(server):
+        # Force password auth so OpenSSH does not hang on keys first.
+        ssh.extend(
+            [
+                "-o",
+                "PreferredAuthentications=password,keyboard-interactive",
+                "-o",
+                "PubkeyAuthentication=no",
+                "-o",
+                "NumberOfPasswordPrompts=1",
+            ]
+        )
     ssh.append(f"{server.user}@{server.host}")
-
-    if use_password and shutil.which("sshpass"):
-        return ["sshpass", "-p", server.password, *ssh]
     return ssh
 
 
 def describe_auth(server: Server) -> str:
     if server.identity:
         return f"key: {server.identity}"
-    if server.password:
-        if shutil.which("sshpass"):
-            return "YAML password via sshpass"
-        return "YAML password (sshpass NOT found → SSH will prompt)"
+    if uses_yaml_password(server):
+        return "YAML password (auto-typed at SSH prompt, no sshpass)"
     return "interactive SSH auth (no pass/key in YAML)"
+
+
+_PASSWORD_RE = re.compile(
+    rb"(?:password:|passphrase for key|verification code:)\s*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+_HOSTKEY_RE = re.compile(
+    rb"are you sure you want to continue connecting",
+    re.IGNORECASE,
+)
+
+
+def _copy_winsize(master_fd: int) -> None:
+    if not sys.stdin.isatty():
+        return
+    try:
+        packed = fcntl.ioctl(sys.stdin.fileno(), termios.TIOCGWINSZ, b"\x00" * 8)
+        fcntl.ioctl(master_fd, termios.TIOCSWINSZ, packed)
+    except OSError:
+        pass
+
+
+def _wait_exit(pid: int) -> int:
+    _, status = os.waitpid(pid, 0)
+    if hasattr(os, "waitstatus_to_exitcode"):
+        return os.waitstatus_to_exitcode(status)
+    if os.WIFEXITED(status):
+        return os.WEXITSTATUS(status)
+    if os.WIFSIGNALED(status):
+        return 128 + os.WTERMSIG(status)
+    return 1
+
+
+def ssh_with_auto_password(argv: List[str], password: str, prompt_timeout: float = 45.0) -> int:
+    """
+    Spawn ssh on a PTY, wait for the password prompt, send the YAML password + Enter,
+    then relay the interactive session. Uses only the Python standard library.
+    """
+    pid, master = pty.fork()
+    if pid == 0:  # child
+        try:
+            os.execvp(argv[0], argv)
+        except OSError as exc:
+            sys.stderr.write(f"Failed to exec {argv[0]}: {exc}\n")
+            os._exit(127)
+
+    # parent
+    _copy_winsize(master)
+
+    def _on_winch(_signum: int, _frame: Any) -> None:
+        _copy_winsize(master)
+
+    prev_winch = signal.signal(signal.SIGWINCH, _on_winch) if hasattr(signal, "SIGWINCH") else None
+
+    stdin_fd = sys.stdin.fileno()
+    stdout_fd = sys.stdout.fileno()
+    old_tty: Optional[list] = None
+    if sys.stdin.isatty():
+        old_tty = termios.tcgetattr(stdin_fd)
+        tty.setraw(stdin_fd)
+
+    buf = b""
+    password_sent = False
+    deadline = time.time() + prompt_timeout
+
+    try:
+        # Phase 1: auto-answer host-key / password prompts
+        while not password_sent:
+            if time.time() > deadline:
+                sys.stderr.write("\nTimed out waiting for the SSH password prompt.\n")
+                os.kill(pid, signal.SIGTERM)
+                return 1
+
+            try:
+                exited_pid, _ = os.waitpid(pid, os.WNOHANG)
+            except ChildProcessError:
+                exited_pid = pid
+            if exited_pid == pid:
+                # Drain remaining output
+                try:
+                    while True:
+                        chunk = os.read(master, 4096)
+                        if not chunk:
+                            break
+                        os.write(stdout_fd, chunk)
+                except OSError:
+                    pass
+                return _wait_exit(pid) if False else 1  # already reaped below
+            # If child already exited, gather status once more after loop
+
+            ready, _, _ = select.select([master], [], [], 0.2)
+            if not ready:
+                continue
+            try:
+                data = os.read(master, 4096)
+            except OSError as exc:
+                if exc.errno == errno.EIO:
+                    break
+                raise
+            if not data:
+                break
+
+            # Show remote output (including "Password:") so the session looks normal
+            os.write(stdout_fd, data)
+            buf += data
+            # Keep a sliding window so prompts at chunk boundaries still match
+            if len(buf) > 8192:
+                buf = buf[-4096:]
+
+            if _HOSTKEY_RE.search(buf):
+                os.write(master, b"yes\n")
+                buf = b""
+                continue
+
+            if _PASSWORD_RE.search(buf):
+                os.write(master, password.encode("utf-8", errors="surrogateescape") + b"\n")
+                password_sent = True
+                buf = b""
+                deadline = time.time() + prompt_timeout  # unused after this, but clear intent
+
+        # Phase 2: full interactive relay until ssh exits
+        while True:
+            try:
+                exited_pid, status = os.waitpid(pid, os.WNOHANG)
+            except ChildProcessError:
+                return 0
+            if exited_pid == pid:
+                # Flush leftover PTY output
+                while True:
+                    r, _, _ = select.select([master], [], [], 0)
+                    if not r:
+                        break
+                    try:
+                        data = os.read(master, 4096)
+                    except OSError:
+                        data = b""
+                    if not data:
+                        break
+                    os.write(stdout_fd, data)
+                if hasattr(os, "waitstatus_to_exitcode"):
+                    return os.waitstatus_to_exitcode(status)
+                if os.WIFEXITED(status):
+                    return os.WEXITSTATUS(status)
+                if os.WIFSIGNALED(status):
+                    return 128 + os.WTERMSIG(status)
+                return 1
+
+            fds = [master]
+            if sys.stdin.isatty():
+                fds.append(stdin_fd)
+            ready, _, _ = select.select(fds, [], [], 0.2)
+            if master in ready:
+                try:
+                    data = os.read(master, 4096)
+                except OSError as exc:
+                    if exc.errno == errno.EIO:
+                        break
+                    raise
+                if not data:
+                    break
+                os.write(stdout_fd, data)
+            if stdin_fd in ready:
+                try:
+                    data = os.read(stdin_fd, 4096)
+                except OSError:
+                    data = b""
+                if not data:
+                    # stdin closed
+                    try:
+                        os.write(master, b"\x04")  # EOT
+                    except OSError:
+                        pass
+                else:
+                    os.write(master, data)
+
+        return _wait_exit(pid)
+    finally:
+        if prev_winch is not None:
+            signal.signal(signal.SIGWINCH, prev_winch)
+        if old_tty is not None:
+            termios.tcsetattr(stdin_fd, termios.TCSADRAIN, old_tty)
+        try:
+            os.close(master)
+        except OSError:
+            pass
 
 
 def connect(server: Server, dry_run: bool = False) -> int:
     argv = build_ssh_argv(server)
-    display = list(argv)
-    if display and display[0] == "sshpass" and len(display) >= 3 and display[1] == "-p":
-        display[2] = "***"
+    auto_pass = uses_yaml_password(server)
 
     print(f"→ {server.label}")
     print(f"  auth: {describe_auth(server)}")
     if server.notes:
         print(f"  notes: {server.notes}")
-    print(f"  cmd: {' '.join(display)}")
+    print(f"  cmd: {' '.join(argv)}")
+    if auto_pass:
+        print("  password: (will be entered automatically at the prompt)")
 
     if dry_run:
         print("(dry-run: connection not opened)")
         return 0
 
-    if server.password and not server.identity and not shutil.which("sshpass"):
-        print(
-            "\nWarning: 'pass' is set in YAML but 'sshpass' is not installed.\n"
-            "  brew install hudochenkov/sshpass/sshpass\n"
-            "or add 'identity: ~/.ssh/id_ed25519' and use a key.\n"
-            "SSH will prompt for the password for now.\n",
-            file=sys.stderr,
-        )
+    if auto_pass:
+        assert server.password is not None
+        return ssh_with_auto_password(argv, server.password)
 
     os.execvp(argv[0], argv)
     return 1  # unreachable
@@ -213,6 +412,56 @@ def _menu_items(servers: List[Server]) -> List[MenuItem]:
     items: List[MenuItem] = list(servers)
     items.append(ADD_ACTION)
     return items
+
+
+def _fit_cell(text: str, width: int) -> str:
+    """Pad or truncate text to an exact column width."""
+    if width <= 0:
+        return ""
+    text = text or ""
+    if len(text) <= width:
+        return text.ljust(width)
+    if width == 1:
+        return text[:1]
+    return text[: width - 1] + "…"
+
+
+def _column_widths(servers: List[Server], term_w: int) -> Tuple[int, int, int]:
+    """
+    Compute name / host / notes column widths for the menu.
+    Leading indent (2) + two gaps (2+2) are reserved outside these widths.
+    """
+    usable = max(16, term_w - 1 - 2 - 4)  # row budget minus indent/gaps
+    name_needed = max((len(s.name) for s in servers), default=4)
+    host_needed = max((len(s.host) for s in servers), default=4)
+    name_w = min(max(name_needed, 8), 24)
+    host_w = min(max(host_needed, 12), 32)
+    if name_w + host_w > usable - 8:
+        # Shrink proportionally on narrow terminals
+        overflow = name_w + host_w - (usable - 8)
+        cut_name = min(name_w - 6, overflow // 2)
+        name_w -= max(0, cut_name)
+        host_w = max(8, host_w - (overflow - max(0, cut_name)))
+    notes_w = max(0, usable - name_w - host_w)
+    return name_w, host_w, notes_w
+
+
+def format_server_row(server: Server, name_w: int, host_w: int, notes_w: int) -> str:
+    name = _fit_cell(server.name, name_w)
+    host = _fit_cell(server.host, host_w)
+    notes = _fit_cell(server.notes or "", notes_w) if notes_w > 0 else ""
+    if notes_w > 0:
+        return f"  {name}  {host}  {notes}"
+    return f"  {name}  {host}"
+
+
+def format_header_row(name_w: int, host_w: int, notes_w: int) -> str:
+    name = _fit_cell("NAME", name_w)
+    host = _fit_cell("HOST", host_w)
+    if notes_w > 0:
+        notes = _fit_cell("NOTES", notes_w)
+        return f"  {name}  {host}  {notes}"
+    return f"  {name}  {host}"
 
 
 def _draw_add_label(stdscr: "curses._CursesWindow", y: int, w: int, selected: bool) -> None:
@@ -419,6 +668,21 @@ def menu_loop(config_path: Path, dry_run: bool = False) -> Tuple[str, Optional[S
                     curses.color_pair(2),
                 )
 
+            name_w, host_w, notes_w = _column_widths(servers, w)
+            show_header = bool(servers) and h > 4
+            if show_header:
+                header = format_header_row(name_w, host_w, notes_w)
+                try:
+                    stdscr.addnstr(
+                        2,
+                        0,
+                        header[: max(0, w - 1)].ljust(min(w - 1, len(header))),
+                        w - 1,
+                        curses.A_DIM | curses.A_BOLD,
+                    )
+                except curses.error:
+                    pass
+
             # Build display rows: (item_index or None for blank, kind)
             # kind: 'server' | 'blank' | 'add'
             display_rows: List[Tuple[Optional[int], str]] = []
@@ -432,7 +696,7 @@ def menu_loop(config_path: Path, dry_run: bool = False) -> Tuple[str, Optional[S
 
             # Find which display row corresponds to idx for scrolling
             focus_row = next(r for r, (ii, _) in enumerate(display_rows) if ii == idx)
-            top_pad = 3
+            top_pad = 3  # rows 0–1 chrome; row 2 header (or blank)
             visible = max(1, h - top_pad - 1)
             start_row = max(0, min(focus_row - visible + 1, len(display_rows) - visible))
 
@@ -448,9 +712,7 @@ def menu_loop(config_path: Path, dry_run: bool = False) -> Tuple[str, Optional[S
                 else:
                     server = items[item_i]  # type: ignore[index]
                     assert isinstance(server, Server)
-                    line = f"  {server.label}"
-                    if server.notes:
-                        line += f"  — {server.notes}"
+                    line = format_server_row(server, name_w, host_w, notes_w)
                     attr = curses.color_pair(1) | curses.A_BOLD if selected else curses.A_NORMAL
                     try:
                         stdscr.addnstr(
