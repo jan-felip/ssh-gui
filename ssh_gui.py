@@ -662,14 +662,7 @@ def menu_loop(config_path: Path, dry_run: bool = False) -> Tuple[str, Optional[S
             h, w = stdscr.getmaxyx()
             title = "ssh-gui — select a server (↑↓ Enter, q quit)"
             stdscr.addnstr(0, 0, title[: max(0, w - 1)], w - 1, curses.A_BOLD)
-            if h > 2:
-                stdscr.addnstr(
-                    1,
-                    0,
-                    "Enter = connect / add · q = quit"[: max(0, w - 1)],
-                    w - 1,
-                    curses.color_pair(2),
-                )
+            # Row 1 left blank for spacing (controls hint removed)
 
             name_w, host_w, notes_w = _column_widths(servers, w)
             show_header = bool(servers) and h > 4
