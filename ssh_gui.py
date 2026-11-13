@@ -55,12 +55,9 @@ TITLE_ART = [
 """.splitlines()[1:]
 ]
 
-SUBTITLE_ART = [
-    "  By Walker #61899",
-]
-
-# Banner = title + subtitle (no blank between) + blank before list chrome
-BANNER_LINE_COUNT = len(TITLE_ART) + len(SUBTITLE_ART) + 1
+SUBTITLE_TEXT = "  By Walker #61899"
+# Banner = title lines (subtitle shares the last title row) + blank before list
+BANNER_LINE_COUNT = len(TITLE_ART) + 1
 COMPACT_TITLE = "ssh-gui"
 # Spacing between NAME / HOST / NOTES (tripled from the original 2 spaces)
 COL_GAP = "      "  # 6 spaces
@@ -151,8 +148,7 @@ def load_servers(config_path: Path) -> List[Server]:
     return parse_servers(load_raw(config_path))
 
 
-def save_server(config_path: Path, server: Server) -> None:
-    """Append or update a server entry in the YAML file."""
+def _read_raw_map(config_path: Path) -> Dict[str, Any]:
     raw: Dict[str, Any] = {}
     if config_path.is_file():
         with config_path.open("r", encoding="utf-8") as fh:
@@ -160,12 +156,10 @@ def save_server(config_path: Path, server: Server) -> None:
         if loaded and not isinstance(loaded, dict):
             raise ValueError("Existing YAML is not a server map; refusing to overwrite.")
         raw = loaded if isinstance(loaded, dict) else {}
+    return raw
 
-    if server.name in raw:
-        raise ValueError(f"A host named '{server.name}' already exists.")
 
-    raw[server.name] = server.to_yaml_dict()
-
+def _write_raw_map(config_path: Path, raw: Dict[str, Any]) -> None:
     config_path.parent.mkdir(parents=True, exist_ok=True)
     with config_path.open("w", encoding="utf-8") as fh:
         yaml.safe_dump(raw, fh, default_flow_style=False, allow_unicode=True, sort_keys=False)
@@ -173,6 +167,41 @@ def save_server(config_path: Path, server: Server) -> None:
         os.chmod(config_path, 0o600)
     except OSError:
         pass
+
+
+def save_server(config_path: Path, server: Server) -> None:
+    """Append a new server entry to the YAML file."""
+    raw = _read_raw_map(config_path)
+    if server.name in raw:
+        raise ValueError(f"A host named '{server.name}' already exists.")
+    raw[server.name] = server.to_yaml_dict()
+    _write_raw_map(config_path, raw)
+
+
+def update_server(config_path: Path, original_name: str, server: Server) -> None:
+    """Update an existing server; supports renaming while preserving order."""
+    raw = _read_raw_map(config_path)
+    if original_name not in raw:
+        raise ValueError(f"Host '{original_name}' was not found in the config.")
+    if server.name != original_name and server.name in raw:
+        raise ValueError(f"A host named '{server.name}' already exists.")
+
+    new_raw: Dict[str, Any] = {}
+    for key, value in raw.items():
+        if key == original_name:
+            new_raw[server.name] = server.to_yaml_dict()
+        else:
+            new_raw[key] = value
+    _write_raw_map(config_path, new_raw)
+
+
+def _identity_display(path: Optional[str]) -> str:
+    if not path:
+        return ""
+    home = str(Path.home())
+    if path.startswith(home + os.sep):
+        return "~" + path[len(home) :]
+    return path
 
 
 def uses_yaml_password(server: Server) -> bool:
@@ -507,7 +536,7 @@ def _safe_add(stdscr: "curses._CursesWindow", y: int, x: int, text: str, attr: i
 
 def draw_banner(stdscr: "curses._CursesWindow", term_h: int, term_w: int) -> int:
     """
-    Draw white TITLE_ART, a blank line, gray SUBTITLE_ART, then a blank spacer.
+    Draw white TITLE_ART; gray subtitle shares the last title row, then a blank spacer.
     Returns the next free row index (top of list chrome).
     Falls back to a one-line compact title when the terminal is too short.
     """
@@ -525,11 +554,15 @@ def draw_banner(stdscr: "curses._CursesWindow", term_h: int, term_w: int) -> int
         _safe_add(stdscr, y, 0, COMPACT_TITLE[: max(0, term_w - 1)], title_attr)
         return 2  # blank row 1 for spacing
 
-    for line in TITLE_ART:
-        _safe_add(stdscr, y, 0, line, title_attr)
-        y += 1
-    for line in SUBTITLE_ART:
-        _safe_add(stdscr, y, 0, line, sub_attr)
+    last_i = len(TITLE_ART) - 1
+    for i, line in enumerate(TITLE_ART):
+        if i != last_i:
+            _safe_add(stdscr, y, 0, line, title_attr)
+        else:
+            # e.g. "  By Walker #61899      /____/"
+            art_tail = line.lstrip()
+            _safe_add(stdscr, y, 0, SUBTITLE_TEXT, sub_attr)
+            _safe_add(stdscr, y, len(SUBTITLE_TEXT), COL_GAP + art_tail, title_attr)
         y += 1
     y += 1  # blank before list / column header
     return y
@@ -613,8 +646,13 @@ def prompt_field(
             pos += 1
 
 
-def add_host_form(stdscr: "curses._CursesWindow", existing_names: set) -> Optional[Server]:
-    """Interactive form to create a new host. Esc cancels."""
+def host_form(
+    stdscr: "curses._CursesWindow",
+    existing_names: set,
+    initial: Optional[Server] = None,
+) -> Optional[Server]:
+    """Interactive form to create or edit a host. Esc cancels."""
+    editing = initial is not None
     fields = [
         ("Name (unique id): ", "", False, True),
         ("Host (IP/hostname): ", "", False, True),
@@ -624,12 +662,29 @@ def add_host_form(stdscr: "curses._CursesWindow", existing_names: set) -> Option
         ("Identity key path (optional): ", "", False, False),
         ("Notes (optional): ", "", False, False),
     ]
-    values: List[str] = [""] * len(fields)
+    if initial:
+        values = [
+            initial.name,
+            initial.host,
+            initial.user,
+            str(initial.port),
+            initial.password or "",
+            _identity_display(initial.identity),
+            initial.notes or "",
+        ]
+        blocked_names = existing_names - {initial.name}
+    else:
+        values = [""] * len(fields)
+        blocked_names = set(existing_names)
 
     while True:
         stdscr.clear()
         h, w = stdscr.getmaxyx()
-        title = "Add host  (Enter confirm field · Esc cancel)"
+        title = (
+            "Edit host  (Enter confirm field · Esc cancel)"
+            if editing
+            else "Add host  (Enter confirm field · Esc cancel)"
+        )
         stdscr.addnstr(0, 0, title[: max(0, w - 1)], w - 1, curses.A_BOLD)
         stdscr.addnstr(
             1,
@@ -643,13 +698,14 @@ def add_host_form(stdscr: "curses._CursesWindow", existing_names: set) -> Option
             y = 3 + i
             if y >= h - 2:
                 break
-            shown = values[i] if values[i] else (default if i != 0 else "")
+            shown = values[i] if values[i] else (default if not editing else "")
             display = ("*" * len(shown)) if _secret and shown else shown
             stdscr.addnstr(y, 0, f"  {label}{display}"[: max(0, w - 1)], w - 1)
 
         stdscr.refresh()
 
         error: Optional[str] = None
+        port = 22
         for i, (label, default, secret, required) in enumerate(fields):
             y = 3 + i
             start = values[i] if values[i] else default
@@ -661,7 +717,7 @@ def add_host_form(stdscr: "curses._CursesWindow", existing_names: set) -> Option
         name, host, user, port_s, password, identity, notes = values
         if not name:
             error = "Name is required."
-        elif name in existing_names:
+        elif name in blocked_names:
             error = f"Name '{name}' already exists."
         elif not host:
             error = "Host is required."
@@ -694,6 +750,18 @@ def add_host_form(stdscr: "curses._CursesWindow", existing_names: set) -> Option
             identity=expand_path(identity) if identity else None,
             notes=notes or None,
         )
+
+
+def add_host_form(stdscr: "curses._CursesWindow", existing_names: set) -> Optional[Server]:
+    return host_form(stdscr, existing_names, initial=None)
+
+
+def edit_host_form(
+    stdscr: "curses._CursesWindow",
+    existing_names: set,
+    server: Server,
+) -> Optional[Server]:
+    return host_form(stdscr, existing_names, initial=server)
 
 
 def menu_loop(config_path: Path, dry_run: bool = False) -> Tuple[str, Optional[Server]]:
@@ -814,6 +882,30 @@ def menu_loop(config_path: Path, dry_run: bool = False) -> Tuple[str, Optional[S
                     continue
                 assert isinstance(chosen, Server)
                 return ("connect", chosen)
+            elif key in (ord("e"), ord("E")):
+                chosen = items[idx]
+                if chosen == ADD_ACTION:
+                    continue  # edit only applies to host rows
+                assert isinstance(chosen, Server)
+                existing = {s.name for s in servers}
+                edited = edit_host_form(stdscr, existing, chosen)
+                if edited is None:
+                    continue
+                try:
+                    update_server(config_path, chosen.name, edited)
+                except ValueError as exc:
+                    stdscr.clear()
+                    stdscr.addstr(0, 0, f"Could not save: {exc}")
+                    stdscr.addstr(2, 0, "Press any key…")
+                    stdscr.getch()
+                    continue
+                servers = load_servers(config_path)
+                items = _menu_items(servers)
+                for i, it in enumerate(items):
+                    if isinstance(it, Server) and it.name == edited.name:
+                        idx = i
+                        break
+                continue
             elif key in (ord("q"), 27):
                 return ("quit", None)
 
