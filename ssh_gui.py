@@ -257,11 +257,11 @@ def ssh_with_auto_password(argv: List[str], password: str, prompt_timeout: float
                 return 1
 
             try:
-                exited_pid, _ = os.waitpid(pid, os.WNOHANG)
+                exited_pid, status = os.waitpid(pid, os.WNOHANG)
             except ChildProcessError:
-                exited_pid = pid
+                return 1
             if exited_pid == pid:
-                # Drain remaining output
+                # Drain remaining output; child already reaped
                 try:
                     while True:
                         chunk = os.read(master, 4096)
@@ -270,8 +270,11 @@ def ssh_with_auto_password(argv: List[str], password: str, prompt_timeout: float
                         os.write(stdout_fd, chunk)
                 except OSError:
                     pass
-                return _wait_exit(pid) if False else 1  # already reaped below
-            # If child already exited, gather status once more after loop
+                if hasattr(os, "waitstatus_to_exitcode"):
+                    return os.waitstatus_to_exitcode(status)
+                if os.WIFEXITED(status):
+                    return os.WEXITSTATUS(status)
+                return 1
 
             ready, _, _ = select.select([master], [], [], 0.2)
             if not ready:
