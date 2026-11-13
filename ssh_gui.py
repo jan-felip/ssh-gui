@@ -43,6 +43,31 @@ EXAMPLE_CONFIG = APP_DIR / "servers.example.yaml"
 ADD_ACTION = "__add_host__"
 MenuItem = Union[str, "Server"]  # Server or ADD_ACTION
 
+TITLE_ART = r"""
+                    /$$                                   /$$
+                   | $$                                  |__/
+  /$$$$$$$ /$$$$$$$| $$$$$$$           /$$$$$$  /$$   /$$ /$$
+ /$$_____//$$_____/| $$__  $$ /$$$$$$ /$$__  $$| $$  | $$| $$
+|  $$$$$$|  $$$$$$ | $$  \ $$|______/| $$  \ $$| $$  | $$| $$
+ \____  $$\____  $$| $$  | $$        | $$  | $$| $$  | $$| $$
+ /$$$$$$$//$$$$$$$/| $$  | $$        |  $$$$$$$|  $$$$$$/| $$
+|_______/|_______/ |__/  |__/         \____  $$ \______/ |__/
+                                      /$$  \ $$
+                                     |  $$$$$$/
+                                      \______/
+""".splitlines()[1:]  # drop leading empty from triple-quote
+
+SUBTITLE_ART = """
+▄     ▖  ▖  ▜ ▌       ▗▗ ▄▖▗ ▄▖▄▖▄▖
+▙▘▌▌  ▌▞▖▌▀▌▐ ▙▘█▌▛▘  ▜▜▘▙▖▜ ▙▌▙▌▙▌
+▙▘▙▌  ▛ ▝▌█▌▐▖▛▖▙▖▌   ▜▜▘▙▌▟▖▙▌▄▌▄▌
+  ▄▌
+""".splitlines()[1:]
+
+# Banner = title + blank + subtitle + blank before list chrome
+BANNER_LINE_COUNT = len(TITLE_ART) + 1 + len(SUBTITLE_ART) + 1
+COMPACT_TITLE = "ssh-gui"
+
 
 @dataclass
 class Server:
@@ -405,10 +430,13 @@ def _init_colors() -> None:
     curses.init_pair(1, curses.COLOR_BLACK, curses.COLOR_CYAN)  # selected row
     curses.init_pair(2, curses.COLOR_YELLOW, -1)  # hints
     curses.init_pair(3, curses.COLOR_GREEN, -1)  # [+]
-    curses.init_pair(4, curses.COLOR_WHITE, -1)  # Add host text
+    curses.init_pair(4, curses.COLOR_WHITE, -1)  # white text / title
     curses.init_pair(5, curses.COLOR_GREEN, curses.COLOR_CYAN)  # [+] selected
     curses.init_pair(6, curses.COLOR_WHITE, curses.COLOR_CYAN)  # Add host selected
     curses.init_pair(7, curses.COLOR_RED, -1)  # errors
+    # Gray subtitle: prefer color 8 (bright black) when the terminal has it
+    gray = 8 if curses.COLORS >= 16 else curses.COLOR_WHITE
+    curses.init_pair(8, gray, -1)
 
 
 def _menu_items(servers: List[Server]) -> List[MenuItem]:
@@ -465,6 +493,47 @@ def format_header_row(name_w: int, host_w: int, notes_w: int) -> str:
         notes = _fit_cell("NOTES", notes_w)
         return f"  {name}  {host}  {notes}"
     return f"  {name}  {host}"
+
+
+def _safe_add(stdscr: "curses._CursesWindow", y: int, x: int, text: str, attr: int = 0) -> None:
+    h, w = stdscr.getmaxyx()
+    if y < 0 or y >= h or x >= w - 1:
+        return
+    try:
+        stdscr.addnstr(y, x, text[: max(0, w - 1 - x)], w - 1 - x, attr)
+    except curses.error:
+        pass
+
+
+def draw_banner(stdscr: "curses._CursesWindow", term_h: int, term_w: int) -> int:
+    """
+    Draw white TITLE_ART, a blank line, gray SUBTITLE_ART, then a blank spacer.
+    Returns the next free row index (top of list chrome).
+    Falls back to a one-line compact title when the terminal is too short.
+    """
+    need = BANNER_LINE_COUNT + 3  # banner + header + ≥2 list rows
+    use_full = term_h >= need and term_w >= 40
+
+    title_attr = curses.color_pair(4) | curses.A_BOLD
+    # Gray: color pair 8; dim further when we fell back to white
+    sub_attr = curses.color_pair(8)
+    if curses.COLORS < 16:
+        sub_attr |= curses.A_DIM
+
+    y = 0
+    if not use_full:
+        _safe_add(stdscr, y, 0, COMPACT_TITLE[: max(0, term_w - 1)], title_attr)
+        return 2  # blank row 1 for spacing
+
+    for line in TITLE_ART:
+        _safe_add(stdscr, y, 0, line, title_attr)
+        y += 1
+    y += 1  # blank between title and subtitle
+    for line in SUBTITLE_ART:
+        _safe_add(stdscr, y, 0, line, sub_attr)
+        y += 1
+    y += 1  # blank before list / column header
+    return y
 
 
 def _draw_add_label(stdscr: "curses._CursesWindow", y: int, w: int, selected: bool) -> None:
@@ -660,24 +729,21 @@ def menu_loop(config_path: Path, dry_run: bool = False) -> Tuple[str, Optional[S
 
             stdscr.clear()
             h, w = stdscr.getmaxyx()
-            title = "ssh-gui — select a server (↑↓ Enter, q quit)"
-            stdscr.addnstr(0, 0, title[: max(0, w - 1)], w - 1, curses.A_BOLD)
-            # Row 1 left blank for spacing (controls hint removed)
+            list_top = draw_banner(stdscr, h, w)
 
             name_w, host_w, notes_w = _column_widths(servers, w)
-            show_header = bool(servers) and h > 4
+            show_header = bool(servers) and (h - list_top) > 2
+            content_top = list_top
             if show_header:
                 header = format_header_row(name_w, host_w, notes_w)
-                try:
-                    stdscr.addnstr(
-                        2,
-                        0,
-                        header[: max(0, w - 1)].ljust(min(w - 1, len(header))),
-                        w - 1,
-                        curses.A_DIM | curses.A_BOLD,
-                    )
-                except curses.error:
-                    pass
+                _safe_add(
+                    stdscr,
+                    list_top,
+                    0,
+                    header.ljust(min(w - 1, max(len(header), 2))),
+                    curses.A_DIM | curses.A_BOLD,
+                )
+                content_top = list_top + 1
 
             # Build display rows: (item_index or None for blank, kind)
             # kind: 'server' | 'blank' | 'add'
@@ -692,12 +758,11 @@ def menu_loop(config_path: Path, dry_run: bool = False) -> Tuple[str, Optional[S
 
             # Find which display row corresponds to idx for scrolling
             focus_row = next(r for r, (ii, _) in enumerate(display_rows) if ii == idx)
-            top_pad = 3  # rows 0–1 chrome; row 2 header (or blank)
-            visible = max(1, h - top_pad - 1)
+            visible = max(1, h - content_top - 1)
             start_row = max(0, min(focus_row - visible + 1, len(display_rows) - visible))
 
             for row_i, (item_i, kind) in enumerate(display_rows[start_row : start_row + visible]):
-                y = top_pad + row_i
+                y = content_top + row_i
                 if y >= h:
                     break
                 if kind == "blank":
@@ -710,16 +775,13 @@ def menu_loop(config_path: Path, dry_run: bool = False) -> Tuple[str, Optional[S
                     assert isinstance(server, Server)
                     line = format_server_row(server, name_w, host_w, notes_w)
                     attr = curses.color_pair(1) | curses.A_BOLD if selected else curses.A_NORMAL
-                    try:
-                        stdscr.addnstr(
-                            y,
-                            0,
-                            line[: max(0, w - 1)].ljust(min(w - 1, max(len(line), 2))),
-                            w - 1,
-                            attr,
-                        )
-                    except curses.error:
-                        pass
+                    _safe_add(
+                        stdscr,
+                        y,
+                        0,
+                        line.ljust(min(w - 1, max(len(line), 2))),
+                        attr,
+                    )
 
             stdscr.refresh()
             key = stdscr.getch()
