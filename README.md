@@ -58,23 +58,27 @@ ssh-gui --connect NAME
 |-----|--------|
 | ↑↓ | Move |
 | Enter | SSH connect (or open Add host) |
-| → | Host **actions** submenu |
-| e | Edit host |
+| e | **Edit** durable config (SSH + `web_*` + `git_*`) |
+| → | Host **runtime actions** (deploy helpers) |
 | q | Quit |
+
+### Edit / Add (`e`)
+
+Owns all saved fields: host/user/pass/identity/notes, plus `web_remote`, `web_local` (Enter on **Web local** opens a folder browser), `git_user`, `git_token`.
 
 ### Host actions (`→`)
 
-| Action | What it does |
+Runtime only — no path settings here. Missing config shows as disabled with a hint to use Edit.
+
+| Action | When enabled |
 |--------|----------------|
-| Set web remote path | Saves `web_remote` |
-| Set local project dir | Folder browser → saves `web_local` |
-| Git user/token | Saves `git_user` / `git_token` (local only) |
-| Git pull | Shown when remote path is a git work tree; `git pull --ff-only` (HTTPS can use stored token) |
-| Upload (rsync) + fix permissions | `rsync -avz --delete` then chmod preset |
-| Fix permissions only | `find` dirs **755** / files **644** on `web_remote` |
+| Git pull | `web_remote` is a git work tree |
+| Commit history | same (`git log` short on remote) |
+| Upload (rsync) + fix permissions | both `web_local` and `web_remote` set |
+| Fix permissions only | `web_remote` set |
 | ← / q | Back to host list |
 
-Upload requires both `web_local` and `web_remote` (you will be prompted to set them if missing). Each run prints the command and waits for Enter before executing.
+Each enabled run prints the command and waits for Enter before executing.
 
 **Permission preset:** after a successful rsync (and via “Fix permissions only”):
 

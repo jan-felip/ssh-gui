@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Host actions submenu: web paths, local dir picker, git pull, rsync+chmod."""
+"""Host actions submenu: runtime ops (git pull/log, rsync, chmod). Config lives in Edit."""
 
 from __future__ import annotations
 
@@ -7,10 +7,9 @@ import curses
 import os
 import shlex
 import subprocess
-import sys
 import urllib.parse
 from pathlib import Path
-from typing import Any, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
 import ssh_gui as core
 
@@ -66,8 +65,6 @@ def run_argv(argv: List[str], server: core.Server, interactive: bool = True) -> 
     password = server.password if core.uses_yaml_password(server) else None
     if password:
         return core.ssh_with_auto_password(argv, password)
-    if interactive:
-        return subprocess.call(argv)
     return subprocess.call(argv)
 
 
@@ -79,10 +76,7 @@ def ssh_remote(server: core.Server, remote_cmd: str, interactive: bool = False) 
 
 
 def ssh_remote_capture(server: core.Server, remote_cmd: str, timeout: float = 60.0) -> Tuple[int, str]:
-    """
-    Run a short remote command and capture stdout+stderr.
-    Password hosts: use a one-shot PTY expect (output may include the prompt line).
-    """
+    """Run a short remote command and capture stdout+stderr."""
     argv = ["ssh", *_ssh_opts(server), _ssh_target(server), remote_cmd]
     if not core.uses_yaml_password(server):
         try:
@@ -97,10 +91,6 @@ def ssh_remote_capture(server: core.Server, remote_cmd: str, timeout: float = 60
         except subprocess.TimeoutExpired:
             return 124, "Timed out."
 
-    # Password path: reuse PTY helper but we need capture — run interactively and
-    # ask the user to rely on visible output for MVP detect; use a temp approach:
-    # Write output via ssh with BatchMode alternative — feed password through PTY
-    # and collect bytes without full stdin relay after auth for short commands.
     return _ssh_capture_with_password(argv, server.password or "", timeout)
 
 
@@ -189,51 +179,12 @@ def remote_is_git(server: core.Server) -> bool:
     return code == 0
 
 
-def prompt_line(stdscr: "curses._CursesWindow", title: str, initial: str = "") -> Optional[str]:
-    """Simple single-field prompt. Esc cancels."""
-    buf = list(initial)
-    pos = len(buf)
-    curses.curs_set(1)
-    while True:
-        stdscr.clear()
-        h, w = stdscr.getmaxyx()
-        core._safe_add(stdscr, 0, 0, title, curses.A_BOLD)
-        core._safe_add(stdscr, 1, 0, "Enter confirm · Esc cancel", curses.color_pair(2))
-        shown = "".join(buf)
-        core._safe_add(stdscr, 3, 2, shown[: max(0, w - 3)], curses.color_pair(1) | curses.A_BOLD)
-        try:
-            stdscr.move(3, min(2 + pos, w - 2))
-        except curses.error:
-            pass
-        stdscr.refresh()
-        key = stdscr.get_wch()
-        if key in ("\n", "\r", curses.KEY_ENTER):
-            curses.curs_set(0)
-            return "".join(buf).strip()
-        if key == "\x1b":
-            curses.curs_set(0)
-            return None
-        if key in (curses.KEY_BACKSPACE, "\x7f", "\b"):
-            if pos > 0:
-                del buf[pos - 1]
-                pos -= 1
-        elif key == curses.KEY_LEFT:
-            pos = max(0, pos - 1)
-        elif key == curses.KEY_RIGHT:
-            pos = min(len(buf), pos + 1)
-        elif key == curses.KEY_DC and pos < len(buf):
-            del buf[pos]
-        elif isinstance(key, str) and key.isprintable():
-            buf.insert(pos, key)
-            pos += 1
-
-
 def pick_local_directory(
     stdscr: "curses._CursesWindow",
     start: Optional[str] = None,
 ) -> Optional[str]:
     """
-    Terminal folder browser.
+    Terminal folder browser (used from Edit form for web_local).
     ↑↓ move · Enter open dir · s select current · ← up · Esc cancel
     """
     cwd = Path(start or Path.home()).expanduser().resolve()
@@ -251,7 +202,6 @@ def pick_local_directory(
         except PermissionError:
             entries = []
 
-        # Synthetic rows: select current, then dirs
         rows: List[Tuple[str, Optional[Path]]] = [
             (f"[Select this folder]  {cwd}", None),
         ]
@@ -302,47 +252,11 @@ def pick_local_directory(
         elif key in (ord("s"), ord("S")):
             return str(cwd)
         elif key in (curses.KEY_ENTER, 10, 13):
-            label, path = rows[idx]
+            _label, path = rows[idx]
             if path is None:
-                # Select this folder
                 return str(cwd)
             cwd = path
             idx = 0
-
-
-def patch_server(config_path: Path, server: core.Server, **fields: Any) -> core.Server:
-    """Update selected fields on a server and persist."""
-    data = server.to_yaml_dict()
-    # Rebuild Server via merge
-    for k, v in fields.items():
-        setattr(server, k, v)
-    core.update_server(config_path, server.name, server)
-    # Reload to normalize paths
-    for s in core.load_servers(config_path):
-        if s.name == server.name:
-            return s
-    return server
-
-
-def ensure_web_paths(
-    stdscr: "curses._CursesWindow",
-    config_path: Path,
-    server: core.Server,
-) -> Optional[core.Server]:
-    """Prompt for missing web_remote / web_local. Returns updated server or None if cancelled."""
-    if not server.web_remote:
-        val = prompt_line(stdscr, "Remote web path (e.g. /var/www/app)", server.web_remote or "")
-        if val is None:
-            return None
-        if not val:
-            return None
-        server = patch_server(config_path, server, web_remote=val)
-    if not server.web_local:
-        picked = pick_local_directory(stdscr, server.web_local)
-        if picked is None:
-            return None
-        server = patch_server(config_path, server, web_local=picked)
-    return server
 
 
 def chmod_preset_cmd(web_remote: str) -> str:
@@ -353,7 +267,7 @@ def chmod_preset_cmd(web_remote: str) -> str:
     )
 
 
-def action_fix_permissions(stdscr: "curses._CursesWindow", server: core.Server) -> None:
+def action_fix_permissions(server: core.Server) -> None:
     if not server.web_remote:
         return
     cmd = chmod_preset_cmd(server.web_remote)
@@ -371,7 +285,7 @@ def action_fix_permissions(stdscr: "curses._CursesWindow", server: core.Server) 
     _pause()
 
 
-def action_rsync_upload(stdscr: "curses._CursesWindow", server: core.Server) -> None:
+def action_rsync_upload(server: core.Server) -> None:
     local = server.web_local
     remote = server.web_remote
     if not local or not remote:
@@ -382,7 +296,6 @@ def action_rsync_upload(stdscr: "curses._CursesWindow", server: core.Server) -> 
         _pause()
         return
 
-    # Trailing slashes: sync contents into remote dir
     src = str(local_path) + os.sep
     dest = f"{_ssh_target(server)}:{remote.rstrip('/')}/"
     ssh_e = "ssh " + " ".join(shlex.quote(o) for o in _ssh_opts(server))
@@ -414,37 +327,13 @@ def action_rsync_upload(stdscr: "curses._CursesWindow", server: core.Server) -> 
     _pause()
 
 
-def action_git_pull(
-    stdscr: "curses._CursesWindow",
-    config_path: Path,
-    server: core.Server,
-) -> core.Server:
-    """Run after curses is suspended (plain terminal I/O)."""
+def action_git_pull(server: core.Server) -> None:
+    """Uses git_user/git_token from Edit/yaml when set. No settings prompts here."""
     if not server.web_remote:
-        return server
+        return
     path_q = shlex.quote(server.web_remote)
 
-    if not server.git_user or not server.git_token:
-        try:
-            ans = input("Set git_user / git_token for private HTTPS? [y/N]: ").strip().lower()
-        except EOFError:
-            ans = "n"
-        if ans in ("y", "yes"):
-            try:
-                gu = input(f"Git username [{server.git_user or ''}]: ").strip() or (server.git_user or "")
-                gt = input("Git token / password: ").strip() or (server.git_token or "")
-            except EOFError:
-                return server
-            server = patch_server(
-                config_path,
-                server,
-                git_user=gu or None,
-                git_token=gt or None,
-            )
-
-    # Build remote pull script
     if server.git_user and server.git_token:
-        # Embed URL-encoded creds (avoid shell metacharacters in the script)
         u = urllib.parse.quote(server.git_user, safe="")
         t = urllib.parse.quote(server.git_token, safe="")
         remote_script = f"""
@@ -471,7 +360,7 @@ esac
     if server.git_user:
         print(f"  git user: {server.git_user} (token: set)")
     else:
-        print("  git auth: none stored (public/SSH remotes OK)")
+        print("  git auth: none in Edit (OK for public/SSH remotes)")
     print("  mode: git pull --ff-only")
     _pause("Press Enter to run (Ctrl+C abort)…")
     try:
@@ -481,7 +370,25 @@ esac
         code = 130
     print(f"Exit: {code}")
     _pause()
-    return server
+
+
+def action_commit_history(server: core.Server, limit: int = 20) -> None:
+    if not server.web_remote:
+        return
+    path_q = shlex.quote(server.web_remote)
+    fmt = shlex.quote("%h %ad %an %s")
+    cmd = f"git -C {path_q} log -n {int(limit)} --date=short --pretty=format:{fmt}"
+    print(f"→ Commit history on {server.label}")
+    print(f"  path: {server.web_remote}")
+    print(f"  cmd:  git log -n {limit} --pretty=…")
+    _pause("Press Enter to run (Ctrl+C abort)…")
+    try:
+        code = ssh_remote(server, cmd, interactive=True)
+    except KeyboardInterrupt:
+        print("\nCancelled.")
+        code = 130
+    print(f"\nExit: {code}")
+    _pause()
 
 
 def host_actions_menu(
@@ -490,73 +397,112 @@ def host_actions_menu(
     server: core.Server,
 ) -> core.Server:
     """
-    Actions for one host. ← / q returns to main list.
-    Reloads/patches server as fields change.
+    Runtime actions only. Paths/creds are configured via Edit (e).
+    ← / q returns to main list.
     """
     idx = 0
     status = ""
-    detecting = True
     is_git: Optional[bool] = None
+    detected = False
 
     while True:
-        # Refresh server from disk each loop so yaml edits stick
         for s in core.load_servers(config_path):
             if s.name == server.name:
                 server = s
                 break
 
-        if detecting:
+        has_remote = bool(server.web_remote)
+        has_local = bool(server.web_local)
+        can_upload = has_remote and has_local
+        can_chmod = has_remote
+        can_git_ops = has_remote
+
+        if has_remote and not detected:
             status = "Detecting remote git…"
             stdscr.clear()
             core._safe_add(stdscr, 0, 0, f"Actions — {server.name}", curses.A_BOLD)
             core._safe_add(stdscr, 2, 0, status, curses.color_pair(2))
             stdscr.refresh()
             try:
-                is_git = remote_is_git(server) if server.web_remote else False
-            except Exception as exc:  # noqa: BLE001 — show in UI
+                is_git = remote_is_git(server)
+                status = "Remote git repo detected." if is_git else "Remote path is not a git work tree."
+            except Exception as exc:  # noqa: BLE001
                 is_git = False
                 status = f"Git detect failed: {exc}"
-            else:
-                status = "Remote is a git repo." if is_git else "Remote is not a git repo (or path unset)."
-            detecting = False
+            detected = True
+        elif not has_remote:
+            is_git = False
+            status = "Set web_remote (and web_local) in Edit (e) to enable actions."
 
-        items: List[Tuple[str, str]] = [
-            ("set_remote", f"Set / change web remote path    {server.web_remote or '(not set)'}"),
-            ("set_local", f"Set / change local project dir  {server.web_local or '(not set)'}"),
-            ("git_creds", f"Git user/token                 {server.git_user or '(not set)'}"),
-        ]
+        # (id, label, enabled)
+        items: List[Tuple[str, str, bool]] = []
         if is_git:
-            items.append(("git_pull", "Git pull"))
-        items.extend(
-            [
-                ("upload", "Upload (rsync) + fix permissions"),
-                ("chmod", "Fix permissions only (dirs 755 / files 644)"),
-                ("redetect", "Re-detect remote git"),
-                ("back", "← Back to host list"),
-            ]
-        )
+            items.append(("git_pull", "Git pull", True))
+            items.append(("git_log", "Commit history", True))
+        elif can_git_ops:
+            items.append(("git_pull", "Git pull  (not a git repo — set web_remote in Edit)", False))
+            items.append(("git_log", "Commit history  (not a git repo — set web_remote in Edit)", False))
+        else:
+            items.append(("git_pull", "Git pull  (set web_remote in Edit)", False))
+            items.append(("git_log", "Commit history  (set web_remote in Edit)", False))
+
+        if can_upload:
+            items.append(("upload", "Upload (rsync) + fix permissions", True))
+        else:
+            items.append(
+                (
+                    "upload",
+                    "Upload (rsync) + fix permissions  (set web_local + web_remote in Edit)",
+                    False,
+                )
+            )
+
+        if can_chmod:
+            items.append(("chmod", "Fix permissions only (dirs 755 / files 644)", True))
+        else:
+            items.append(("chmod", "Fix permissions only  (set web_remote in Edit)", False))
+
+        items.append(("back", "← Back to host list", True))
 
         stdscr.clear()
         h, w = stdscr.getmaxyx()
         core._safe_add(stdscr, 0, 0, f"Actions — {server.name} ({server.host})", curses.A_BOLD)
-        core._safe_add(stdscr, 1, 0, "Enter run · ← / q back", curses.color_pair(2))
+        core._safe_add(stdscr, 1, 0, "Enter run · ← / q back · configure paths in Edit (e)", curses.color_pair(2))
         if status:
             core._safe_add(stdscr, 2, 0, status[: max(0, w - 1)], curses.A_DIM)
 
-        top = 4
+        # Show current paths (read-only summary)
+        summary = (
+            f"web_remote={server.web_remote or '—'}   "
+            f"web_local={server.web_local or '—'}"
+        )
+        core._safe_add(stdscr, 3, 0, summary[: max(0, w - 1)], curses.A_DIM)
+
+        top = 5
         idx = max(0, min(idx, len(items) - 1))
-        for i, (_key, label) in enumerate(items):
+        for i, (_key, label, enabled) in enumerate(items):
             y = top + i
             if y >= h - 1:
                 break
             selected = i == idx
-            attr = curses.color_pair(1) | curses.A_BOLD if selected else curses.A_NORMAL
-            if selected:
+            if selected and enabled:
                 try:
                     stdscr.addnstr(y, 0, " " * max(0, w - 1), w - 1, curses.color_pair(1))
                 except curses.error:
                     pass
-            core._safe_add(stdscr, y, 2, label[: max(0, w - 3)], attr)
+                attr = curses.color_pair(1) | curses.A_BOLD
+            elif selected and not enabled:
+                try:
+                    stdscr.addnstr(y, 0, " " * max(0, w - 1), w - 1, curses.A_DIM)
+                except curses.error:
+                    pass
+                attr = curses.A_DIM | curses.A_BOLD
+            elif not enabled:
+                attr = curses.A_DIM
+            else:
+                attr = curses.A_NORMAL
+            prefix = "  " if enabled else "  · "
+            core._safe_add(stdscr, y, 0, (prefix + label)[: max(0, w - 1)], attr)
 
         stdscr.refresh()
         key = stdscr.getch()
@@ -567,69 +513,37 @@ def host_actions_menu(
         elif key in (curses.KEY_LEFT, 27, ord("q")):
             return server
         elif key in (curses.KEY_ENTER, 10, 13):
-            action = items[idx][0]
+            action, _label, enabled = items[idx]
             if action == "back":
                 return server
-            if action == "set_remote":
-                val = prompt_line(
-                    stdscr,
-                    "Remote web path (absolute path on server)",
-                    server.web_remote or "",
-                )
-                if val is not None:
-                    server = patch_server(config_path, server, web_remote=val or None)
-                    detecting = True
-                    status = "Saved web_remote."
-            elif action == "set_local":
-                picked = pick_local_directory(stdscr, server.web_local)
-                if picked is not None:
-                    server = patch_server(config_path, server, web_local=picked)
-                    status = f"Saved web_local: {picked}"
-            elif action == "git_creds":
-                gu = prompt_line(stdscr, "Git username", server.git_user or "")
-                if gu is None:
-                    continue
-                gt = prompt_line(stdscr, "Git token / password", server.git_token or "")
-                if gt is None:
-                    continue
-                server = patch_server(
-                    config_path,
-                    server,
-                    git_user=gu or None,
-                    git_token=gt or None,
-                )
-                status = "Saved git credentials (local yaml only)."
-            elif action == "redetect":
-                detecting = True
-            elif action == "git_pull":
+            if not enabled:
+                status = "Disabled — set paths/credentials in Edit (e), then reopen →."
+                continue
+            if action == "git_pull":
                 _suspend_curses(stdscr)
                 try:
-                    server = action_git_pull(stdscr, config_path, server)
+                    action_git_pull(server)
                 finally:
                     _resume_curses(stdscr)
                 status = "Git pull finished."
-            elif action == "upload":
-                updated = ensure_web_paths(stdscr, config_path, server)
-                if updated is None:
-                    status = "Upload cancelled (need web_local + web_remote)."
-                    continue
-                server = updated
+            elif action == "git_log":
                 _suspend_curses(stdscr)
                 try:
-                    action_rsync_upload(stdscr, server)
+                    action_commit_history(server)
+                finally:
+                    _resume_curses(stdscr)
+                status = "Commit history finished."
+            elif action == "upload":
+                _suspend_curses(stdscr)
+                try:
+                    action_rsync_upload(server)
                 finally:
                     _resume_curses(stdscr)
                 status = "Upload finished."
             elif action == "chmod":
-                if not server.web_remote:
-                    val = prompt_line(stdscr, "Remote web path required", "")
-                    if not val:
-                        status = "web_remote required."
-                        continue
-                    server = patch_server(config_path, server, web_remote=val)
                 _suspend_curses(stdscr)
                 try:
-                    action_fix_permissions(stdscr, server)
+                    action_fix_permissions(server)
                 finally:
                     _resume_curses(stdscr)
                 status = "Permissions fix finished."

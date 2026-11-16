@@ -797,7 +797,11 @@ def host_form(
         stdscr.clear()
         h, w = stdscr.getmaxyx()
         title = "Edit host" if editing else "Add host"
-        hint = "↑↓ move  type to edit  Enter next/action  Esc cancel"
+        focused_key = FORM_FIELDS[idx][0] if idx < n_fields else ""
+        if focused_key == "web_local":
+            hint = "↑↓ move  type path  Enter browse folders  Esc cancel"
+        else:
+            hint = "↑↓ move  type to edit  Enter next/action  Esc cancel"
         _safe_add(stdscr, 0, 0, title, curses.A_BOLD)
         _safe_add(stdscr, 1, 0, hint, curses.color_pair(2))
 
@@ -927,9 +931,26 @@ def host_form(
             return None
         elif key in ("\n", "\r", curses.KEY_ENTER):
             if idx < n_fields:
-                _commit_field_buf(values, FORM_FIELDS[idx][0], buf)
-                focus_row(idx + 1)
-                error = None
+                key_name = FORM_FIELDS[idx][0]
+                _commit_field_buf(values, key_name, buf)
+                if key_name == "web_local":
+                    # Directory picker owns durable web_local config
+                    from host_actions import pick_local_directory
+
+                    start = values["web_local"] or None
+                    picked = pick_local_directory(stdscr, start)
+                    if picked is not None:
+                        values["web_local"] = _identity_display(picked) or picked
+                        buf = list(values["web_local"])
+                        pos = len(buf)
+                    else:
+                        buf = list(values["web_local"])
+                        pos = len(buf)
+                    curses.curs_set(1)
+                    error = None
+                else:
+                    focus_row(idx + 1)
+                    error = None
             else:
                 action = actions[idx - n_fields]
                 if action == ACTION_DISCARD:
