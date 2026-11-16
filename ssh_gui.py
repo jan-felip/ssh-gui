@@ -479,6 +479,8 @@ def _init_colors() -> None:
     curses.init_pair(11, curses.COLOR_WHITE, curses.COLOR_GREEN)  # save focused
     curses.init_pair(12, curses.COLOR_GREEN, curses.COLOR_GREEN)  # [+] on green bg
     curses.init_pair(13, curses.COLOR_BLACK, curses.COLOR_CYAN)  # asterisk on selected row
+    curses.init_pair(14, curses.COLOR_YELLOW, -1)  # [-] discard
+    curses.init_pair(15, curses.COLOR_WHITE, curses.COLOR_YELLOW)  # discard focused
 
 
 def _menu_items(servers: List[Server]) -> List[MenuItem]:
@@ -625,6 +627,7 @@ FORM_FIELDS: List[Tuple[str, str, bool, bool]] = [
 ]
 FORM_LABEL_W = 12
 ACTION_REMOVE = "remove"
+ACTION_DISCARD = "discard"
 ACTION_SAVE = "save"
 
 
@@ -727,8 +730,11 @@ def host_form(
         blocked_names = set(existing_names)
         original_name = ""
 
-    # Selectable rows: fields then actions (remove only when editing)
-    actions: List[str] = [ACTION_REMOVE, ACTION_SAVE] if editing else [ACTION_SAVE]
+    # Selectable rows: fields then actions
+    # Edit → Remove Host; Add → Discard changes
+    actions: List[str] = (
+        [ACTION_REMOVE, ACTION_SAVE] if editing else [ACTION_DISCARD, ACTION_SAVE]
+    )
     n_fields = len(FORM_FIELDS)
     n_items = n_fields + len(actions)
     idx = 0
@@ -831,6 +837,18 @@ def host_form(
                 else:
                     _safe_add(stdscr, y, 2, mark, curses.color_pair(7) | curses.A_BOLD)
                     _safe_add(stdscr, y, 2 + len(mark), rest, curses.color_pair(4))
+            elif action == ACTION_DISCARD:
+                mark, rest = "[-]", " Discard changes"
+                if selected:
+                    try:
+                        stdscr.addnstr(y, 0, " " * max(0, w - 1), w - 1, curses.color_pair(15))
+                    except curses.error:
+                        pass
+                    _safe_add(stdscr, y, 2, mark, curses.color_pair(15) | curses.A_BOLD)
+                    _safe_add(stdscr, y, 2 + len(mark), rest, curses.color_pair(15) | curses.A_BOLD)
+                else:
+                    _safe_add(stdscr, y, 2, mark, curses.color_pair(14) | curses.A_BOLD)
+                    _safe_add(stdscr, y, 2 + len(mark), rest, curses.color_pair(4))
             else:  # SAVE
                 mark, rest = "[+]", " Save changes"
                 if selected:
@@ -880,6 +898,8 @@ def host_form(
                 error = None
             else:
                 action = actions[idx - n_fields]
+                if action == ACTION_DISCARD:
+                    return None  # cancel add → back to main menu, nothing saved
                 if action == ACTION_REMOVE:
                     label = values["name"].strip() or original_name or "this host"
                     if _confirm_dialog(stdscr, f"Remove '{label}'?"):
