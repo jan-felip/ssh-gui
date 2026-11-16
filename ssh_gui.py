@@ -9,6 +9,7 @@ import errno
 import fcntl
 import locale
 import os
+import pty
 import re
 import select
 import signal
@@ -650,59 +651,9 @@ def _confirm_dialog(stdscr: "curses._CursesWindow", message: str) -> bool:
             return False
 
 
-def _edit_field_value(
-    stdscr: "curses._CursesWindow",
-    y: int,
-    value_x: int,
-    initial: str,
-    secret: bool,
-    row_w: int,
-) -> Optional[str]:
-    """Inline edit at value column. Enter commits, Esc cancels (returns None)."""
-    curses.curs_set(1)
-    buf = list(initial)
-    pos = len(buf)
-    while True:
-        shown = ("*" * len(buf)) if secret else "".join(buf)
-        avail = max(1, row_w - value_x - 1)
-        # Scroll so cursor stays visible
-        view_start = max(0, pos - avail + 1)
-        view = shown[view_start : view_start + avail]
-        try:
-            stdscr.move(y, value_x)
-            stdscr.clrtoeol()
-            stdscr.addnstr(y, value_x, view.ljust(avail)[:avail], avail, curses.color_pair(1))
-            cursor_x = value_x + min(pos - view_start, avail - 1)
-            stdscr.move(y, max(value_x, cursor_x))
-            stdscr.refresh()
-        except curses.error:
-            pass
-
-        key = stdscr.get_wch()
-        if key in ("\n", "\r", curses.KEY_ENTER):
-            curses.curs_set(0)
-            return "".join(buf)
-        if key == "\x1b":
-            curses.curs_set(0)
-            return None
-        if key in (curses.KEY_BACKSPACE, "\x7f", "\b"):
-            if pos > 0:
-                del buf[pos - 1]
-                pos -= 1
-        elif key == curses.KEY_LEFT:
-            pos = max(0, pos - 1)
-        elif key == curses.KEY_RIGHT:
-            pos = min(len(buf), pos + 1)
-        elif key == curses.KEY_DC:
-            if pos < len(buf):
-                del buf[pos]
-        elif key == curses.KEY_HOME:
-            pos = 0
-        elif key == curses.KEY_END:
-            pos = len(buf)
-        elif isinstance(key, str) and key.isprintable():
-            buf.insert(pos, key)
-            pos += 1
+def _commit_field_buf(values: Dict[str, str], key: str, buf: List[str]) -> None:
+    text = "".join(buf)
+    values[key] = text if key == "password" else text.strip()
 
 
 def _build_server_from_values(
@@ -753,7 +704,8 @@ def host_form(
     initial: Optional[Server] = None,
 ) -> Optional[Tuple[str, Optional[Server]]]:
     """
-    Navigate fields with ↑↓; Enter edits a field or activates an action.
+    Navigate fields with ↑↓; typing edits the focused field immediately.
+    Enter commits the field and moves to the next row (or runs an action).
     Returns ('save', Server), ('remove', None), or None if cancelled.
     """
     editing = initial is not None
@@ -781,33 +733,54 @@ def host_form(
     n_items = n_fields + len(actions)
     idx = 0
     error: Optional[str] = None
-    curses.curs_set(0)
+
+    # Live buffer for the focused field (typing applies immediately)
+    buf: List[str] = list(values[FORM_FIELDS[0][0]])
+    pos = len(buf)
+    curses.curs_set(1)
+
+    def focus_row(new_idx: int) -> None:
+        nonlocal idx, buf, pos
+        if idx < n_fields:
+            _commit_field_buf(values, FORM_FIELDS[idx][0], buf)
+        idx = new_idx % n_items
+        if idx < n_fields:
+            buf = list(values[FORM_FIELDS[idx][0]])
+            pos = len(buf)
+            curses.curs_set(1)
+        else:
+            buf = []
+            pos = 0
+            curses.curs_set(0)
 
     while True:
         stdscr.clear()
         h, w = stdscr.getmaxyx()
         title = "Edit host" if editing else "Add host"
-        hint = "↑↓ move  Enter edit/action  Esc cancel"
+        hint = "↑↓ move  type to edit  Enter next/action  Esc cancel"
         _safe_add(stdscr, 0, 0, title, curses.A_BOLD)
         _safe_add(stdscr, 1, 0, hint, curses.color_pair(2))
 
         label_w = FORM_LABEL_W
         value_x = 2 + label_w + 3  # "  LABEL  " + gap before value
-        # Mark column between label and value
         mark_x = 2 + label_w
 
         field_top = 3
+        cursor_y = field_top
+        cursor_x = value_x
         for i, (key, label, required, secret) in enumerate(FORM_FIELDS):
             y = field_top + i
             if y >= h - 1:
                 break
             selected = idx == i
-            raw_val = values[key]
+            if selected:
+                raw_val = "".join(buf)
+            else:
+                raw_val = values[key]
             display_val = ("*" * len(raw_val)) if secret and raw_val else raw_val
             if key == "port" and not display_val:
                 display_val = "22"
 
-            # Background for selected field row
             if selected:
                 try:
                     stdscr.addnstr(y, 0, " " * max(0, w - 1), w - 1, curses.color_pair(1))
@@ -822,13 +795,21 @@ def host_form(
                 star_attr = curses.color_pair(7) | curses.A_BOLD
 
             _safe_add(stdscr, y, 2, _fit_cell(label, label_w), lab_attr)
-            # Red asterisk while required & empty; space otherwise (keeps columns aligned)
-            needs_star = required and not values[key].strip()
+            needs_star = required and not raw_val.strip()
             if needs_star:
                 _safe_add(stdscr, y, mark_x, "*", star_attr)
             else:
                 _safe_add(stdscr, y, mark_x, " ", lab_attr if selected else curses.A_NORMAL)
-            _safe_add(stdscr, y, value_x, display_val, val_attr)
+
+            avail = max(1, w - 1 - value_x)
+            if selected:
+                view_start = max(0, pos - avail + 1)
+                view = display_val[view_start : view_start + avail]
+                _safe_add(stdscr, y, value_x, view.ljust(avail)[:avail], val_attr)
+                cursor_y = y
+                cursor_x = value_x + min(pos - view_start, avail - 1)
+            else:
+                _safe_add(stdscr, y, value_x, display_val[:avail], val_attr)
 
         # Blank line, then actions
         action_top = field_top + n_fields + 1
@@ -875,32 +856,27 @@ def host_form(
             except curses.error:
                 pass
 
+        if idx < n_fields:
+            try:
+                stdscr.move(cursor_y, max(0, min(cursor_x, w - 2)))
+            except curses.error:
+                pass
         stdscr.refresh()
-        key = stdscr.getch()
 
-        if key in (curses.KEY_UP, ord("k")):
-            idx = (idx - 1) % n_items
+        key = stdscr.get_wch()
+
+        if key in (curses.KEY_UP,):
+            focus_row(idx - 1)
             error = None
-        elif key in (curses.KEY_DOWN, ord("j")):
-            idx = (idx + 1) % n_items
+        elif key in (curses.KEY_DOWN,):
+            focus_row(idx + 1)
             error = None
-        elif key in (27, ord("q")):
+        elif key == "\x1b":
             return None
-        elif key in (curses.KEY_ENTER, 10, 13):
+        elif key in ("\n", "\r", curses.KEY_ENTER):
             if idx < n_fields:
-                key_name, _label, _req, secret = FORM_FIELDS[idx]
-                y = field_top + idx
-                # Paint selection then edit
-                edited = _edit_field_value(
-                    stdscr,
-                    y,
-                    value_x,
-                    values[key_name],
-                    secret=secret,
-                    row_w=w,
-                )
-                if edited is not None:
-                    values[key_name] = edited if key_name == "password" else edited.strip()
+                _commit_field_buf(values, FORM_FIELDS[idx][0], buf)
+                focus_row(idx + 1)
                 error = None
             else:
                 action = actions[idx - n_fields]
@@ -909,8 +885,8 @@ def host_form(
                     if _confirm_dialog(stdscr, f"Remove '{label}'?"):
                         return ("remove", None)
                     error = None
+                    curses.curs_set(0)
                 elif action == ACTION_SAVE:
-                    # Block save while required fields empty
                     missing = [
                         label
                         for key, label, required, _s in FORM_FIELDS
@@ -918,10 +894,9 @@ def host_form(
                     ]
                     if missing:
                         error = f"Required: {', '.join(missing)}"
-                        # Jump to first missing field
                         for i, (key, _l, required, _s) in enumerate(FORM_FIELDS):
                             if required and not values[key].strip():
-                                idx = i
+                                focus_row(i)
                                 break
                         continue
                     server, err = _build_server_from_values(values, blocked_names)
@@ -929,6 +904,39 @@ def host_form(
                         error = err or "Could not save."
                         continue
                     return ("save", server)
+        elif idx < n_fields:
+            # Immediate inline editing on the focused field
+            if key in (curses.KEY_BACKSPACE, "\x7f", "\b"):
+                if pos > 0:
+                    del buf[pos - 1]
+                    pos -= 1
+                error = None
+            elif key == curses.KEY_LEFT:
+                pos = max(0, pos - 1)
+            elif key == curses.KEY_RIGHT:
+                pos = min(len(buf), pos + 1)
+            elif key == curses.KEY_DC:
+                if pos < len(buf):
+                    del buf[pos]
+                error = None
+            elif key == curses.KEY_HOME:
+                pos = 0
+            elif key == curses.KEY_END:
+                pos = len(buf)
+            elif isinstance(key, str) and key.isprintable():
+                buf.insert(pos, key)
+                pos += 1
+                error = None
+        else:
+            # On action rows, allow j/k as vim-style navigation
+            if key in ("k", "K"):
+                focus_row(idx - 1)
+                error = None
+            elif key in ("j", "J"):
+                focus_row(idx + 1)
+                error = None
+            elif key in ("q", "Q"):
+                return None
 
 
 def add_host_form(
