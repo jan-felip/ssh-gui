@@ -195,6 +195,15 @@ def update_server(config_path: Path, original_name: str, server: Server) -> None
     _write_raw_map(config_path, new_raw)
 
 
+def delete_server(config_path: Path, name: str) -> None:
+    """Remove a server entry from the YAML file."""
+    raw = _read_raw_map(config_path)
+    if name not in raw:
+        raise ValueError(f"Host '{name}' was not found in the config.")
+    del raw[name]
+    _write_raw_map(config_path, raw)
+
+
 def _identity_display(path: Optional[str]) -> str:
     if not path:
         return ""
@@ -454,16 +463,21 @@ def _init_colors() -> None:
         return
     curses.start_color()
     curses.use_default_colors()
-    curses.init_pair(1, curses.COLOR_BLACK, curses.COLOR_CYAN)  # selected row
+    curses.init_pair(1, curses.COLOR_BLACK, curses.COLOR_CYAN)  # selected row (blue/cyan)
     curses.init_pair(2, curses.COLOR_YELLOW, -1)  # hints
     curses.init_pair(3, curses.COLOR_GREEN, -1)  # [+]
     curses.init_pair(4, curses.COLOR_WHITE, -1)  # white text / title
-    curses.init_pair(5, curses.COLOR_GREEN, curses.COLOR_CYAN)  # [+] selected
-    curses.init_pair(6, curses.COLOR_WHITE, curses.COLOR_CYAN)  # Add host selected
-    curses.init_pair(7, curses.COLOR_RED, -1)  # errors
+    curses.init_pair(5, curses.COLOR_GREEN, curses.COLOR_CYAN)  # [+] on cyan
+    curses.init_pair(6, curses.COLOR_WHITE, curses.COLOR_CYAN)  # text on cyan
+    curses.init_pair(7, curses.COLOR_RED, -1)  # errors / red mark / [-]
     # Gray subtitle: prefer color 8 (bright black) when the terminal has it
     gray = 8 if curses.COLORS >= 16 else curses.COLOR_WHITE
     curses.init_pair(8, gray, -1)
+    curses.init_pair(9, curses.COLOR_WHITE, curses.COLOR_RED)  # remove focused
+    curses.init_pair(10, curses.COLOR_RED, curses.COLOR_RED)  # [-] on red bg
+    curses.init_pair(11, curses.COLOR_WHITE, curses.COLOR_GREEN)  # save focused
+    curses.init_pair(12, curses.COLOR_GREEN, curses.COLOR_GREEN)  # [+] on green bg
+    curses.init_pair(13, curses.COLOR_BLACK, curses.COLOR_CYAN)  # asterisk on selected row
 
 
 def _menu_items(servers: List[Server]) -> List[MenuItem]:
@@ -598,27 +612,68 @@ def _draw_add_label(stdscr: "curses._CursesWindow", y: int, w: int, selected: bo
         pass
 
 
-def prompt_field(
+# Form field keys / labels. required → red asterisk while empty. secret → mask value.
+FORM_FIELDS: List[Tuple[str, str, bool, bool]] = [
+    ("name", "Name", True, False),
+    ("host", "Host", True, False),
+    ("user", "User", True, False),
+    ("port", "Port", False, False),
+    ("password", "Password", False, True),
+    ("identity", "Identity", False, False),
+    ("notes", "Notes", False, False),
+]
+FORM_LABEL_W = 12
+ACTION_REMOVE = "remove"
+ACTION_SAVE = "save"
+
+
+def _confirm_dialog(stdscr: "curses._CursesWindow", message: str) -> bool:
+    """Simple Enter=yes / Esc=no confirm strip at the bottom."""
+    h, w = stdscr.getmaxyx()
+    prompt = f"{message}  Enter=yes  Esc=no"
+    try:
+        stdscr.addnstr(
+            h - 1,
+            0,
+            prompt[: max(0, w - 1)].ljust(w - 1),
+            w - 1,
+            curses.color_pair(2) | curses.A_BOLD,
+        )
+        stdscr.refresh()
+    except curses.error:
+        pass
+    while True:
+        key = stdscr.getch()
+        if key in (curses.KEY_ENTER, 10, 13, ord("y"), ord("Y")):
+            return True
+        if key in (27, ord("n"), ord("N"), ord("q")):
+            return False
+
+
+def _edit_field_value(
     stdscr: "curses._CursesWindow",
     y: int,
-    label: str,
-    default: str = "",
-    secret: bool = False,
+    value_x: int,
+    initial: str,
+    secret: bool,
+    row_w: int,
 ) -> Optional[str]:
-    """Single-line field editor. Returns None if cancelled (Esc)."""
-    h, w = stdscr.getmaxyx()
+    """Inline edit at value column. Enter commits, Esc cancels (returns None)."""
     curses.curs_set(1)
-    buf = list(default)
+    buf = list(initial)
     pos = len(buf)
     while True:
+        shown = ("*" * len(buf)) if secret else "".join(buf)
+        avail = max(1, row_w - value_x - 1)
+        # Scroll so cursor stays visible
+        view_start = max(0, pos - avail + 1)
+        view = shown[view_start : view_start + avail]
         try:
-            stdscr.move(y, 0)
+            stdscr.move(y, value_x)
             stdscr.clrtoeol()
-            shown = ("*" * len(buf)) if secret else "".join(buf)
-            line = f"{label}{shown}"
-            stdscr.addnstr(y, 0, line[: max(0, w - 1)], w - 1)
-            cursor_x = min(len(label) + pos, w - 2)
-            stdscr.move(y, max(0, cursor_x))
+            stdscr.addnstr(y, value_x, view.ljust(avail)[:avail], avail, curses.color_pair(1))
+            cursor_x = value_x + min(pos - view_start, avail - 1)
+            stdscr.move(y, max(value_x, cursor_x))
             stdscr.refresh()
         except curses.error:
             pass
@@ -627,7 +682,7 @@ def prompt_field(
         if key in ("\n", "\r", curses.KEY_ENTER):
             curses.curs_set(0)
             return "".join(buf)
-        if key == "\x1b":  # Esc
+        if key == "\x1b":
             curses.curs_set(0)
             return None
         if key in (curses.KEY_BACKSPACE, "\x7f", "\b"):
@@ -641,107 +696,45 @@ def prompt_field(
         elif key == curses.KEY_DC:
             if pos < len(buf):
                 del buf[pos]
+        elif key == curses.KEY_HOME:
+            pos = 0
+        elif key == curses.KEY_END:
+            pos = len(buf)
         elif isinstance(key, str) and key.isprintable():
             buf.insert(pos, key)
             pos += 1
 
 
-def host_form(
-    stdscr: "curses._CursesWindow",
-    existing_names: set,
-    initial: Optional[Server] = None,
-) -> Optional[Server]:
-    """Interactive form to create or edit a host. Esc cancels."""
-    editing = initial is not None
-    fields = [
-        ("Name (unique id): ", "", False, True),
-        ("Host (IP/hostname): ", "", False, True),
-        ("User: ", "", False, True),
-        ("Port [22]: ", "22", False, False),
-        ("Password (optional): ", "", True, False),
-        ("Identity key path (optional): ", "", False, False),
-        ("Notes (optional): ", "", False, False),
-    ]
-    if initial:
-        values = [
-            initial.name,
-            initial.host,
-            initial.user,
-            str(initial.port),
-            initial.password or "",
-            _identity_display(initial.identity),
-            initial.notes or "",
-        ]
-        blocked_names = existing_names - {initial.name}
-    else:
-        values = [""] * len(fields)
-        blocked_names = set(existing_names)
+def _build_server_from_values(
+    values: Dict[str, str],
+    blocked_names: set,
+) -> Tuple[Optional[Server], Optional[str]]:
+    """Validate form values → (Server, None) or (None, error)."""
+    name = values["name"].strip()
+    host = values["host"].strip()
+    user = values["user"].strip()
+    port_s = values["port"].strip()
+    password = values["password"].strip()
+    identity = values["identity"].strip()
+    notes = values["notes"].strip()
 
-    while True:
-        stdscr.clear()
-        h, w = stdscr.getmaxyx()
-        title = (
-            "Edit host  (Enter confirm field · Esc cancel)"
-            if editing
-            else "Add host  (Enter confirm field · Esc cancel)"
-        )
-        stdscr.addnstr(0, 0, title[: max(0, w - 1)], w - 1, curses.A_BOLD)
-        stdscr.addnstr(
-            1,
-            0,
-            "Required: name, host, user. Prefer a key over a password."[: max(0, w - 1)],
-            w - 1,
-            curses.color_pair(2),
-        )
+    if not name:
+        return None, "Name is required."
+    if name in blocked_names:
+        return None, f"Name '{name}' already exists."
+    if not host:
+        return None, "Host is required."
+    if not user:
+        return None, "User is required."
+    try:
+        port = int(port_s) if port_s else 22
+        if port < 1 or port > 65535:
+            raise ValueError
+    except ValueError:
+        return None, "Port must be a number between 1 and 65535."
 
-        for i, (label, default, _secret, _req) in enumerate(fields):
-            y = 3 + i
-            if y >= h - 2:
-                break
-            shown = values[i] if values[i] else (default if not editing else "")
-            display = ("*" * len(shown)) if _secret and shown else shown
-            stdscr.addnstr(y, 0, f"  {label}{display}"[: max(0, w - 1)], w - 1)
-
-        stdscr.refresh()
-
-        error: Optional[str] = None
-        port = 22
-        for i, (label, default, secret, required) in enumerate(fields):
-            y = 3 + i
-            start = values[i] if values[i] else default
-            result = prompt_field(stdscr, y, f"  {label}", start, secret=secret)
-            if result is None:
-                return None
-            values[i] = result.strip()
-
-        name, host, user, port_s, password, identity, notes = values
-        if not name:
-            error = "Name is required."
-        elif name in blocked_names:
-            error = f"Name '{name}' already exists."
-        elif not host:
-            error = "Host is required."
-        elif not user:
-            error = "User is required."
-        else:
-            try:
-                port = int(port_s) if port_s else 22
-                if port < 1 or port > 65535:
-                    raise ValueError
-            except ValueError:
-                error = "Port must be a number between 1 and 65535."
-                port = 22
-
-        if error:
-            try:
-                stdscr.addnstr(h - 1, 0, error[: max(0, w - 1)].ljust(w - 1), w - 1, curses.color_pair(7))
-                stdscr.refresh()
-                stdscr.getch()
-            except curses.error:
-                pass
-            continue
-
-        return Server(
+    return (
+        Server(
             name=name,
             host=host,
             user=user,
@@ -749,10 +742,199 @@ def host_form(
             port=port,
             identity=expand_path(identity) if identity else None,
             notes=notes or None,
-        )
+        ),
+        None,
+    )
 
 
-def add_host_form(stdscr: "curses._CursesWindow", existing_names: set) -> Optional[Server]:
+def host_form(
+    stdscr: "curses._CursesWindow",
+    existing_names: set,
+    initial: Optional[Server] = None,
+) -> Optional[Tuple[str, Optional[Server]]]:
+    """
+    Navigate fields with ↑↓; Enter edits a field or activates an action.
+    Returns ('save', Server), ('remove', None), or None if cancelled.
+    """
+    editing = initial is not None
+    if initial:
+        values: Dict[str, str] = {
+            "name": initial.name,
+            "host": initial.host,
+            "user": initial.user,
+            "port": str(initial.port),
+            "password": initial.password or "",
+            "identity": _identity_display(initial.identity),
+            "notes": initial.notes or "",
+        }
+        blocked_names = set(existing_names) - {initial.name}
+        original_name = initial.name
+    else:
+        values = {key: "" for key, *_ in FORM_FIELDS}
+        values["port"] = "22"
+        blocked_names = set(existing_names)
+        original_name = ""
+
+    # Selectable rows: fields then actions (remove only when editing)
+    actions: List[str] = [ACTION_REMOVE, ACTION_SAVE] if editing else [ACTION_SAVE]
+    n_fields = len(FORM_FIELDS)
+    n_items = n_fields + len(actions)
+    idx = 0
+    error: Optional[str] = None
+    curses.curs_set(0)
+
+    while True:
+        stdscr.clear()
+        h, w = stdscr.getmaxyx()
+        title = "Edit host" if editing else "Add host"
+        hint = "↑↓ move  Enter edit/action  Esc cancel"
+        _safe_add(stdscr, 0, 0, title, curses.A_BOLD)
+        _safe_add(stdscr, 1, 0, hint, curses.color_pair(2))
+
+        label_w = FORM_LABEL_W
+        value_x = 2 + label_w + 3  # "  LABEL  " + gap before value
+        # Mark column between label and value
+        mark_x = 2 + label_w
+
+        field_top = 3
+        for i, (key, label, required, secret) in enumerate(FORM_FIELDS):
+            y = field_top + i
+            if y >= h - 1:
+                break
+            selected = idx == i
+            raw_val = values[key]
+            display_val = ("*" * len(raw_val)) if secret and raw_val else raw_val
+            if key == "port" and not display_val:
+                display_val = "22"
+
+            # Background for selected field row
+            if selected:
+                try:
+                    stdscr.addnstr(y, 0, " " * max(0, w - 1), w - 1, curses.color_pair(1))
+                except curses.error:
+                    pass
+                lab_attr = curses.color_pair(1) | curses.A_BOLD
+                val_attr = curses.color_pair(1) | curses.A_BOLD
+                star_attr = curses.color_pair(13) | curses.A_BOLD
+            else:
+                lab_attr = curses.A_NORMAL
+                val_attr = curses.color_pair(4)
+                star_attr = curses.color_pair(7) | curses.A_BOLD
+
+            _safe_add(stdscr, y, 2, _fit_cell(label, label_w), lab_attr)
+            # Red asterisk while required & empty; space otherwise (keeps columns aligned)
+            needs_star = required and not values[key].strip()
+            if needs_star:
+                _safe_add(stdscr, y, mark_x, "*", star_attr)
+            else:
+                _safe_add(stdscr, y, mark_x, " ", lab_attr if selected else curses.A_NORMAL)
+            _safe_add(stdscr, y, value_x, display_val, val_attr)
+
+        # Blank line, then actions
+        action_top = field_top + n_fields + 1
+        for a_i, action in enumerate(actions):
+            y = action_top + a_i
+            item_i = n_fields + a_i
+            selected = idx == item_i
+            if y >= h - 1:
+                break
+            if action == ACTION_REMOVE:
+                mark, rest = "[-]", " Remove Host"
+                if selected:
+                    try:
+                        stdscr.addnstr(y, 0, " " * max(0, w - 1), w - 1, curses.color_pair(9))
+                    except curses.error:
+                        pass
+                    _safe_add(stdscr, y, 2, mark, curses.color_pair(9) | curses.A_BOLD)
+                    _safe_add(stdscr, y, 2 + len(mark), rest, curses.color_pair(9) | curses.A_BOLD)
+                else:
+                    _safe_add(stdscr, y, 2, mark, curses.color_pair(7) | curses.A_BOLD)
+                    _safe_add(stdscr, y, 2 + len(mark), rest, curses.color_pair(4))
+            else:  # SAVE
+                mark, rest = "[+]", " Save changes"
+                if selected:
+                    try:
+                        stdscr.addnstr(y, 0, " " * max(0, w - 1), w - 1, curses.color_pair(11))
+                    except curses.error:
+                        pass
+                    _safe_add(stdscr, y, 2, mark, curses.color_pair(11) | curses.A_BOLD)
+                    _safe_add(stdscr, y, 2 + len(mark), rest, curses.color_pair(11) | curses.A_BOLD)
+                else:
+                    _safe_add(stdscr, y, 2, mark, curses.color_pair(3) | curses.A_BOLD)
+                    _safe_add(stdscr, y, 2 + len(mark), rest, curses.color_pair(4))
+
+        if error:
+            try:
+                stdscr.addnstr(
+                    h - 1,
+                    0,
+                    error[: max(0, w - 1)].ljust(w - 1),
+                    w - 1,
+                    curses.color_pair(7) | curses.A_BOLD,
+                )
+            except curses.error:
+                pass
+
+        stdscr.refresh()
+        key = stdscr.getch()
+
+        if key in (curses.KEY_UP, ord("k")):
+            idx = (idx - 1) % n_items
+            error = None
+        elif key in (curses.KEY_DOWN, ord("j")):
+            idx = (idx + 1) % n_items
+            error = None
+        elif key in (27, ord("q")):
+            return None
+        elif key in (curses.KEY_ENTER, 10, 13):
+            if idx < n_fields:
+                key_name, _label, _req, secret = FORM_FIELDS[idx]
+                y = field_top + idx
+                # Paint selection then edit
+                edited = _edit_field_value(
+                    stdscr,
+                    y,
+                    value_x,
+                    values[key_name],
+                    secret=secret,
+                    row_w=w,
+                )
+                if edited is not None:
+                    values[key_name] = edited if key_name == "password" else edited.strip()
+                error = None
+            else:
+                action = actions[idx - n_fields]
+                if action == ACTION_REMOVE:
+                    label = values["name"].strip() or original_name or "this host"
+                    if _confirm_dialog(stdscr, f"Remove '{label}'?"):
+                        return ("remove", None)
+                    error = None
+                elif action == ACTION_SAVE:
+                    # Block save while required fields empty
+                    missing = [
+                        label
+                        for key, label, required, _s in FORM_FIELDS
+                        if required and not values[key].strip()
+                    ]
+                    if missing:
+                        error = f"Required: {', '.join(missing)}"
+                        # Jump to first missing field
+                        for i, (key, _l, required, _s) in enumerate(FORM_FIELDS):
+                            if required and not values[key].strip():
+                                idx = i
+                                break
+                        continue
+                    server, err = _build_server_from_values(values, blocked_names)
+                    if err or server is None:
+                        error = err or "Could not save."
+                        continue
+                    return ("save", server)
+
+
+def add_host_form(
+    stdscr: "curses._CursesWindow",
+    existing_names: set,
+) -> Optional[Tuple[str, Optional[Server]]]:
     return host_form(stdscr, existing_names, initial=None)
 
 
@@ -760,7 +942,7 @@ def edit_host_form(
     stdscr: "curses._CursesWindow",
     existing_names: set,
     server: Server,
-) -> Optional[Server]:
+) -> Optional[Tuple[str, Optional[Server]]]:
     return host_form(stdscr, existing_names, initial=server)
 
 
@@ -861,8 +1043,11 @@ def menu_loop(config_path: Path, dry_run: bool = False) -> Tuple[str, Optional[S
                 chosen = items[idx]
                 if chosen == ADD_ACTION:
                     existing = {s.name for s in servers}
-                    new_server = add_host_form(stdscr, existing)
-                    if new_server is None:
+                    result = add_host_form(stdscr, existing)
+                    if result is None:
+                        continue
+                    action, new_server = result
+                    if action != "save" or new_server is None:
                         continue
                     try:
                         save_server(config_path, new_server)
@@ -872,7 +1057,6 @@ def menu_loop(config_path: Path, dry_run: bool = False) -> Tuple[str, Optional[S
                         stdscr.addstr(2, 0, "Press any key…")
                         stdscr.getch()
                         continue
-                    # Stay in menu; select the new host
                     servers = load_servers(config_path)
                     items = _menu_items(servers)
                     for i, it in enumerate(items):
@@ -888,8 +1072,24 @@ def menu_loop(config_path: Path, dry_run: bool = False) -> Tuple[str, Optional[S
                     continue  # edit only applies to host rows
                 assert isinstance(chosen, Server)
                 existing = {s.name for s in servers}
-                edited = edit_host_form(stdscr, existing, chosen)
-                if edited is None:
+                result = edit_host_form(stdscr, existing, chosen)
+                if result is None:
+                    continue
+                action, edited = result
+                if action == "remove":
+                    try:
+                        delete_server(config_path, chosen.name)
+                    except ValueError as exc:
+                        stdscr.clear()
+                        stdscr.addstr(0, 0, f"Could not remove: {exc}")
+                        stdscr.addstr(2, 0, "Press any key…")
+                        stdscr.getch()
+                        continue
+                    servers = load_servers(config_path)
+                    items = _menu_items(servers)
+                    idx = min(idx, max(0, len(items) - 1))
+                    continue
+                if action != "save" or edited is None:
                     continue
                 try:
                     update_server(config_path, chosen.name, edited)
