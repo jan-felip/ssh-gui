@@ -65,6 +65,13 @@ COL_GAP = "      "  # 6 spaces
 COL_GAP_LEN = len(COL_GAP)
 
 
+def _home_tilde(path: str) -> str:
+    home = str(Path.home())
+    if path.startswith(home + os.sep):
+        return "~" + path[len(home) :]
+    return path
+
+
 @dataclass
 class Server:
     name: str
@@ -74,6 +81,10 @@ class Server:
     port: int = 22
     identity: Optional[str] = None
     notes: Optional[str] = None
+    web_remote: Optional[str] = None
+    web_local: Optional[str] = None
+    git_user: Optional[str] = None
+    git_token: Optional[str] = None
 
     @property
     def label(self) -> str:
@@ -89,14 +100,17 @@ class Server:
         if self.password:
             data["pass"] = self.password
         if self.identity:
-            # Store with ~ if under home, for readability
-            home = str(Path.home())
-            ident = self.identity
-            if ident.startswith(home + os.sep):
-                ident = "~" + ident[len(home) :]
-            data["identity"] = ident
+            data["identity"] = _home_tilde(self.identity)
         if self.notes:
             data["notes"] = self.notes
+        if self.web_remote:
+            data["web_remote"] = self.web_remote
+        if self.web_local:
+            data["web_local"] = _home_tilde(self.web_local)
+        if self.git_user:
+            data["git_user"] = self.git_user
+        if self.git_token:
+            data["git_token"] = self.git_token
         return data
 
 
@@ -140,6 +154,10 @@ def parse_servers(raw: Dict[str, Any]) -> List[Server]:
                 port=port,
                 identity=expand_path(data.get("identity") or data.get("key")),
                 notes=(str(data["notes"]) if data.get("notes") else None),
+                web_remote=(str(data["web_remote"]) if data.get("web_remote") else None),
+                web_local=expand_path(str(data["web_local"])) if data.get("web_local") else None,
+                git_user=(str(data["git_user"]) if data.get("git_user") else None),
+                git_token=(str(data["git_token"]) if data.get("git_token") else None),
             )
         )
     return servers
@@ -624,6 +642,10 @@ FORM_FIELDS: List[Tuple[str, str, bool, bool]] = [
     ("password", "Password", False, True),
     ("identity", "Identity", False, False),
     ("notes", "Notes", False, False),
+    ("web_remote", "Web remote", False, False),
+    ("web_local", "Web local", False, False),
+    ("git_user", "Git user", False, False),
+    ("git_token", "Git token", False, True),
 ]
 FORM_LABEL_W = 12
 ACTION_REMOVE = "remove"
@@ -668,9 +690,13 @@ def _build_server_from_values(
     host = values["host"].strip()
     user = values["user"].strip()
     port_s = values["port"].strip()
-    password = values["password"].strip()
-    identity = values["identity"].strip()
-    notes = values["notes"].strip()
+    password = values.get("password", "")
+    identity = values.get("identity", "").strip()
+    notes = values.get("notes", "").strip()
+    web_remote = values.get("web_remote", "").strip()
+    web_local = values.get("web_local", "").strip()
+    git_user = values.get("git_user", "").strip()
+    git_token = values.get("git_token", "")
 
     if not name:
         return None, "Name is required."
@@ -696,6 +722,10 @@ def _build_server_from_values(
             port=port,
             identity=expand_path(identity) if identity else None,
             notes=notes or None,
+            web_remote=web_remote or None,
+            web_local=expand_path(web_local) if web_local else None,
+            git_user=git_user or None,
+            git_token=git_token or None,
         ),
         None,
     )
@@ -721,6 +751,10 @@ def host_form(
             "password": initial.password or "",
             "identity": _identity_display(initial.identity),
             "notes": initial.notes or "",
+            "web_remote": initial.web_remote or "",
+            "web_local": _identity_display(initial.web_local),
+            "git_user": initial.git_user or "",
+            "git_token": initial.git_token or "",
         }
         blocked_names = set(existing_names) - {initial.name}
         original_name = initial.name
@@ -1067,6 +1101,26 @@ def menu_loop(config_path: Path, dry_run: bool = False) -> Tuple[str, Optional[S
                 idx = (idx - 1) % n
             elif key in (curses.KEY_DOWN, ord("j")):
                 idx = (idx + 1) % n
+            elif key == curses.KEY_RIGHT:
+                chosen = items[idx]
+                if chosen == ADD_ACTION:
+                    continue
+                assert isinstance(chosen, Server)
+                # Late import avoids circular load at startup
+                from host_actions import host_actions_menu
+
+                host_actions_menu(stdscr, config_path, chosen)
+                # Reload in case actions patched yaml
+                servers = load_servers(config_path)
+                items = _menu_items(servers)
+                # Keep selection on same host name when possible
+                for i, it in enumerate(items):
+                    if isinstance(it, Server) and it.name == chosen.name:
+                        idx = i
+                        break
+                else:
+                    idx = min(idx, max(0, len(items) - 1))
+                continue
             elif key in (curses.KEY_ENTER, 10, 13):
                 chosen = items[idx]
                 if chosen == ADD_ACTION:

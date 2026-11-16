@@ -1,14 +1,13 @@
 # ssh-gui
 
-Terminal TUI to quickly SSH into hosts defined in a local YAML inventory.
+Terminal TUI to quickly SSH into hosts defined in a local YAML inventory, plus a host **actions** menu for deploy helpers (rsync, git pull, permissions).
 
 ## Requirements
 
 - macOS with Python 3 (system Python is fine)
-- `ssh` (OpenSSH)
-- Optional: [sshpass](https://formulae.brew.sh/) to inject a YAML password  
-  `brew install hudochenkov/sshpass/sshpass`
+- `ssh` / `rsync` (OpenSSH)
 - Preferred: SSH keys via `identity` instead of `pass`
+- YAML passwords are auto-typed at the SSH prompt (stdlib PTY; no sshpass required)
 
 ## Quick install
 
@@ -28,75 +27,93 @@ source ~/.zshrc
 
 ## Configuration
 
-1. Copy the example (also done by `install.sh` when missing):
-
-```bash
-cp servers.example.yaml servers.yaml
-chmod 600 servers.yaml
-```
-
-2. Edit `servers.yaml`, **or** add hosts from the TUI (`[+] Add host`):
-
 ```yaml
 my_server_name:
   host: 10.0.0.5
   user: jan
   pass: "optional"
   port: 22
-  identity: ~/.ssh/id_ed25519   # optional; wins over pass when both set
+  identity: ~/.ssh/id_ed25519
   notes: "short menu label"
+  web_remote: /var/www/app          # remote path for rsync / git
+  web_local: ~/Projects/my-app      # local folder to upload
+  git_user: jan                     # optional HTTPS git auth on remote
+  git_token: "never-commit-this"
 ```
 
-**Important:** `servers.yaml` is gitignored. Never push real credentials. Only commit `servers.example.yaml`.
+**Important:** `servers.yaml` is gitignored. Never push real passwords or `git_token` values. Only commit `servers.example.yaml`.
 
 ## Usage
 
 ```bash
-ssh-gui              # TUI (↑↓ + Enter, q quit; [+] Add host at the bottom)
-ssh-gui --list       # list without menu
-ssh-gui --dry-run    # pick a host and print the command
-ssh-gui --connect my_server_name
-ssh-gui --add        # add a host via plain prompts
-ssh-gui -c ~/other.yaml
+ssh-gui              # TUI
+ssh-gui --list
+ssh-gui --dry-run
+ssh-gui --connect NAME
 ```
 
-In the menu, hosts are listed first; then a blank line; then **`[+] Add host`** (`[+]` green, rest white). Selecting it opens a form and appends the host to `servers.yaml`.
+### Main list
+
+| Key | Action |
+|-----|--------|
+| ↑↓ | Move |
+| Enter | SSH connect (or open Add host) |
+| → | Host **actions** submenu |
+| e | Edit host |
+| q | Quit |
+
+### Host actions (`→`)
+
+| Action | What it does |
+|--------|----------------|
+| Set web remote path | Saves `web_remote` |
+| Set local project dir | Folder browser → saves `web_local` |
+| Git user/token | Saves `git_user` / `git_token` (local only) |
+| Git pull | Shown when remote path is a git work tree; `git pull --ff-only` (HTTPS can use stored token) |
+| Upload (rsync) + fix permissions | `rsync -avz --delete` then chmod preset |
+| Fix permissions only | `find` dirs **755** / files **644** on `web_remote` |
+| ← / q | Back to host list |
+
+Upload requires both `web_local` and `web_remote` (you will be prompted to set them if missing). Each run prints the command and waits for Enter before executing.
+
+**Permission preset:** after a successful rsync (and via “Fix permissions only”):
+
+```bash
+find <web_remote> -type d -exec chmod 755 {} +
+find <web_remote> -type f -exec chmod 644 {} +
+```
 
 ## Auth
 
 | Situation | Behaviour |
 |-----------|-----------|
 | `identity` set | `ssh -i …` |
-| `pass` without identity + `sshpass` installed | `sshpass -p … ssh …` |
-| `pass` without `sshpass` | Warning + SSH prompts interactively |
-| Neither | Normal interactive SSH auth |
+| `pass` without identity | Password auto-typed at the prompt (PTY) |
+| Neither | Interactive SSH auth |
 
 ## Security
 
 - Keep `servers.yaml` mode `600`.
-- Prefer keys (`identity`) over plaintext passwords.
-- Do not commit secrets; `.gitignore` excludes `servers.yaml` and `.venv/`.
-- `sshpass` exposes the password in the process argv — local/trusted use only.
+- Prefer keys over plaintext passwords / tokens.
+- Never commit `servers.yaml` or real `git_token` values.
 
 ## Layout
 
 ```
 ~/ssh-gui/
-  ssh_gui.py              # logic + TUI (curses)
-  bin/ssh-gui             # launcher → .venv
-  servers.example.yaml    # safe template for the repo
-  servers.yaml            # LOCAL secrets (gitignored)
-  requirements.txt
-  install.sh
-  README.md
-  .gitignore
+  ssh_gui.py
+  host_actions.py         # → submenu (rsync / git / paths)
+  bin/ssh-gui
+  servers.example.yaml
+  servers.yaml            # LOCAL (gitignored)
+  …
 ```
 
-## Future GitHub repo
+## Try it
 
 ```bash
-cd ~/ssh-gui
-git add .gitignore README.md requirements.txt install.sh ssh_gui.py bin/ssh-gui servers.example.yaml
-git status   # confirm servers.yaml is NOT listed
-# then: remote + push when ready
+ssh-gui
+# highlight a host → press →
+# set web remote + local dir, then Upload or Git pull
+# Enter on the host still opens a normal SSH session
 ```

@@ -3,14 +3,19 @@
 #   chmod 600 servers.yaml
 #
 # Or add hosts from the TUI: select "[+] Add host" at the bottom of the menu.
+# Press → on a host for deploy actions (web paths, git pull, rsync).
 #
 # Fields:
-#   host      (required) IP or hostname
-#   user      (required) SSH username
-#   pass      (optional) password — prefer identity when possible
-#   port      (optional) SSH port, default 22
-#   identity  (optional) private key path (~/.ssh/id_ed25519)
-#   notes     (optional) short label shown in the menu
+#   host        (required) IP or hostname
+#   user        (required) SSH username
+#   pass        (optional) password — prefer identity when possible
+#   port        (optional) SSH port, default 22
+#   identity    (optional) private key path (~/.ssh/id_ed25519)
+#   notes       (optional) short label shown in the menu
+#   web_remote  (optional) remote web/app path (e.g. /var/www/app)
+#   web_local   (optional) local project directory to rsync from
+#   git_user    (optional) username for private HTTPS git pull on remote
+#   git_token   (optional) token/password for git — NEVER commit real tokens
 
 example_lab:
   host: 192.0.2.10
@@ -18,6 +23,10 @@ example_lab:
   pass: "change-me"
   port: 22
   notes: "Example with password (DOCUMENTATION — not a real server)"
+  web_remote: /var/www/example
+  web_local: ~/Projects/example
+  # git_user: deploy
+  # git_token: "replace-me"
 
 example_with_key:
   host: 192.0.2.20
@@ -31,3 +40,5 @@ example_with_key:
 #   user: jan
 #   identity: ~/.ssh/id_ed25519
 #   notes: "Production"
+#   web_remote: /web
+#   web_local: ~/code/my-site
