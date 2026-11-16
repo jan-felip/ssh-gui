@@ -730,10 +730,10 @@ def host_form(
         blocked_names = set(existing_names)
         original_name = ""
 
-    # Selectable rows: fields then actions
-    # Edit → Remove Host; Add → Discard changes
+    # Selectable rows: fields then actions (Save first)
+    # Edit → Save + Remove Host; Add → Save + Discard changes
     actions: List[str] = (
-        [ACTION_REMOVE, ACTION_SAVE] if editing else [ACTION_DISCARD, ACTION_SAVE]
+        [ACTION_SAVE, ACTION_REMOVE] if editing else [ACTION_SAVE, ACTION_DISCARD]
     )
     n_fields = len(FORM_FIELDS)
     n_items = n_fields + len(actions)
