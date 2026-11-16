@@ -9,7 +9,7 @@ import shlex
 import subprocess
 import urllib.parse
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Any, List, Optional, Tuple
 
 import ssh_gui as core
 
@@ -94,10 +94,44 @@ def ssh_remote_capture(server: core.Server, remote_cmd: str, timeout: float = 60
     return _ssh_capture_with_password(argv, server.password or "", timeout)
 
 
+def _exit_status_code(status: int) -> int:
+    if hasattr(os, "waitstatus_to_exitcode"):
+        return os.waitstatus_to_exitcode(status)
+    if os.WIFEXITED(status):
+        return os.WEXITSTATUS(status)
+    if os.WIFSIGNALED(status):
+        return 128 + os.WTERMSIG(status)
+    return 1
+
+
+def _drain_pty(master: int) -> bytes:
+    import select
+
+    out = b""
+    while True:
+        r, _, _ = select.select([master], [], [], 0)
+        if not r:
+            break
+        try:
+            chunk = os.read(master, 4096)
+        except OSError:
+            break
+        if not chunk:
+            break
+        out += chunk
+    return out
+
+
 def _ssh_capture_with_password(argv: List[str], password: str, timeout: float) -> Tuple[int, str]:
+    """
+    Run argv on a PTY, auto-answer the SSH password prompt, capture output.
+    Important: on PTY EOF/EIO after the remote command finishes, reap the real
+    exit code — do not report timeout (124) just because the master hit EOF.
+    """
     import errno
     import pty
     import select
+    import signal
     import time
 
     pid, master = pty.fork()
@@ -111,30 +145,22 @@ def _ssh_capture_with_password(argv: List[str], password: str, timeout: float) -
     collected = b""
     password_sent = False
     deadline = time.time() + timeout
+    timed_out = False
     try:
-        while time.time() < deadline:
+        while True:
+            now = time.time()
+            if now >= deadline:
+                timed_out = True
+                break
+
             try:
                 exited, status = os.waitpid(pid, os.WNOHANG)
             except ChildProcessError:
-                break
+                collected += _drain_pty(master)
+                return 1, collected.decode("utf-8", errors="replace")
             if exited == pid:
-                while True:
-                    r, _, _ = select.select([master], [], [], 0)
-                    if not r:
-                        break
-                    try:
-                        chunk = os.read(master, 4096)
-                    except OSError:
-                        chunk = b""
-                    if not chunk:
-                        break
-                    collected += chunk
-                code = (
-                    os.waitstatus_to_exitcode(status)
-                    if hasattr(os, "waitstatus_to_exitcode")
-                    else (os.WEXITSTATUS(status) if os.WIFEXITED(status) else 1)
-                )
-                return code, collected.decode("utf-8", errors="replace")
+                collected += _drain_pty(master)
+                return _exit_status_code(status), collected.decode("utf-8", errors="replace")
 
             r, _, _ = select.select([master], [], [], 0.2)
             if not r:
@@ -143,10 +169,13 @@ def _ssh_capture_with_password(argv: List[str], password: str, timeout: float) -
                 data = os.read(master, 4096)
             except OSError as exc:
                 if exc.errno == errno.EIO:
+                    # Child closed the PTY — fall through to waitpid
                     break
                 raise
             if not data:
+                # EOF — remote command finished; reap below
                 break
+
             collected += data
             buf += data
             if len(buf) > 8192:
@@ -155,14 +184,47 @@ def _ssh_capture_with_password(argv: List[str], password: str, timeout: float) -
                 os.write(master, b"yes\n")
                 buf = b""
             elif not password_sent and core._PASSWORD_RE.search(buf):
-                os.write(master, password.encode("utf-8", errors="surrogateescape") + b"\n")
+                os.write(
+                    master,
+                    password.encode("utf-8", errors="surrogateescape") + b"\n",
+                )
                 password_sent = True
                 buf = b""
+
+        if timed_out:
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except OSError:
+                pass
+
+        # Reap after EOF/EIO/timeout (blocking wait with short grace on timeout)
         try:
-            os.kill(pid, 15)
-        except OSError:
-            pass
-        return 124, collected.decode("utf-8", errors="replace")
+            if timed_out:
+                # Give process a moment to die after SIGTERM
+                end = time.time() + 2
+                status = None
+                while time.time() < end:
+                    exited, status = os.waitpid(pid, os.WNOHANG)
+                    if exited == pid:
+                        break
+                    time.sleep(0.05)
+                else:
+                    try:
+                        os.kill(pid, signal.SIGKILL)
+                    except OSError:
+                        pass
+                    _, status = os.waitpid(pid, 0)
+                    collected += _drain_pty(master)
+                    return 124, collected.decode("utf-8", errors="replace")
+                collected += _drain_pty(master)
+                # Timed out waiting for prompt/command — still prefer real code if reaped
+                return 124, collected.decode("utf-8", errors="replace")
+            _, status = os.waitpid(pid, 0)
+            collected += _drain_pty(master)
+            return _exit_status_code(status), collected.decode("utf-8", errors="replace")
+        except ChildProcessError:
+            collected += _drain_pty(master)
+            return (124 if timed_out else 1), collected.decode("utf-8", errors="replace")
     finally:
         try:
             os.close(master)
@@ -170,12 +232,28 @@ def _ssh_capture_with_password(argv: List[str], password: str, timeout: float) -
             pass
 
 
+def normalize_remote_path(path: str) -> str:
+    """Strip whitespace and trailing slashes (keep root '/')."""
+    p = (path or "").strip()
+    if len(p) > 1:
+        p = p.rstrip("/")
+    return p
+
+
 def remote_is_git(server: core.Server) -> bool:
     if not server.web_remote:
         return False
-    path = shlex.quote(server.web_remote)
-    cmd = f"git -C {path} rev-parse --is-inside-work-tree >/dev/null 2>&1"
-    code, _ = ssh_remote_capture(server, cmd)
+    path = normalize_remote_path(server.web_remote)
+    if not path:
+        return False
+    quoted = shlex.quote(path)
+    # Prefer explicit checks; avoid >/dev/null so password-PTY capture still sees activity.
+    # .git may be a dir or a gitfile (worktrees).
+    cmd = (
+        f"if [ -e {quoted}/.git ] || git -C {quoted} rev-parse --is-inside-work-tree >/dev/null 2>&1; "
+        f"then exit 0; else exit 1; fi"
+    )
+    code, _out = ssh_remote_capture(server, cmd)
     return code == 0
 
 
@@ -400,7 +478,7 @@ def host_actions_menu(
     Runtime actions only. Paths/creds are configured via Edit (e).
     ← / q returns to main list.
     """
-    idx = 0
+    focus = 0  # index into selectable action list
     status = ""
     is_git: Optional[bool] = None
     detected = False
@@ -415,13 +493,12 @@ def host_actions_menu(
         has_local = bool(server.web_local)
         can_upload = has_remote and has_local
         can_chmod = has_remote
-        can_git_ops = has_remote
 
         if has_remote and not detected:
             status = "Detecting remote git…"
             stdscr.clear()
-            core._safe_add(stdscr, 0, 0, f"Actions — {server.name}", curses.A_BOLD)
-            core._safe_add(stdscr, 2, 0, status, curses.color_pair(2))
+            core._safe_add(stdscr, 0, 2, server.name, curses.color_pair(4) | curses.A_BOLD)
+            core._safe_add(stdscr, 2, 2, status, curses.color_pair(2))
             stdscr.refresh()
             try:
                 is_git = remote_is_git(server)
@@ -434,57 +511,87 @@ def host_actions_menu(
             is_git = False
             status = "Set web_remote (and web_local) in Edit (e) to enable actions."
 
+        # Selectable actions only (section labels are visual)
         # (id, label, enabled)
-        items: List[Tuple[str, str, bool]] = []
+        git_actions: List[Tuple[str, str, bool]] = []
         if is_git:
-            items.append(("git_pull", "Git pull", True))
-            items.append(("git_log", "Commit history", True))
-        elif can_git_ops:
-            items.append(("git_pull", "Git pull  (not a git repo — set web_remote in Edit)", False))
-            items.append(("git_log", "Commit history  (not a git repo — set web_remote in Edit)", False))
+            git_actions.append(("git_pull", "Pull", True))
+            git_actions.append(("git_log", "History", True))
+        elif has_remote:
+            git_actions.append(("git_pull", "Pull  (not a git repo)", False))
+            git_actions.append(("git_log", "History  (not a git repo)", False))
         else:
-            items.append(("git_pull", "Git pull  (set web_remote in Edit)", False))
-            items.append(("git_log", "Commit history  (set web_remote in Edit)", False))
+            git_actions.append(("git_pull", "Pull  (set web_remote in Edit)", False))
+            git_actions.append(("git_log", "History  (set web_remote in Edit)", False))
 
+        deploy_actions: List[Tuple[str, str, bool]] = []
         if can_upload:
-            items.append(("upload", "Upload (rsync) + fix permissions", True))
+            deploy_actions.append(("upload", "Rsync upload + fix permissions", True))
         else:
-            items.append(
-                (
-                    "upload",
-                    "Upload (rsync) + fix permissions  (set web_local + web_remote in Edit)",
-                    False,
-                )
+            deploy_actions.append(
+                ("upload", "Rsync upload + fix permissions  (set web_local + web_remote in Edit)", False)
             )
-
         if can_chmod:
-            items.append(("chmod", "Fix permissions only (dirs 755 / files 644)", True))
+            deploy_actions.append(("chmod", "Fix permissions only (dirs 755 / files 644)", True))
         else:
-            items.append(("chmod", "Fix permissions only  (set web_remote in Edit)", False))
+            deploy_actions.append(("chmod", "Fix permissions only  (set web_remote in Edit)", False))
 
-        items.append(("back", "← Back to host list", True))
+        selectable: List[Tuple[str, str, bool]] = [
+            *git_actions,
+            *deploy_actions,
+            ("back", "← Back to host list", True),
+        ]
+
+        # Display rows: ('section', title) | ('item', selectable_index)
+        display: List[Tuple[str, Any]] = [
+            ("section", "Git"),
+            *[("item", i) for i in range(len(git_actions))],
+            ("section", "Deploy"),
+            *[("item", len(git_actions) + i) for i in range(len(deploy_actions))],
+            ("blank", None),
+            ("item", len(selectable) - 1),  # back
+        ]
 
         stdscr.clear()
         h, w = stdscr.getmaxyx()
-        core._safe_add(stdscr, 0, 0, f"Actions — {server.name} ({server.host})", curses.A_BOLD)
-        core._safe_add(stdscr, 1, 0, "Enter run · ← / q back · configure paths in Edit (e)", curses.color_pair(2))
-        if status:
-            core._safe_add(stdscr, 2, 0, status[: max(0, w - 1)], curses.A_DIM)
-
-        # Show current paths (read-only summary)
-        summary = (
-            f"web_remote={server.web_remote or '—'}   "
-            f"web_local={server.web_local or '—'}"
+        # Header: host name prominent
+        core._safe_add(stdscr, 0, 2, server.name, curses.color_pair(4) | curses.A_BOLD)
+        core._safe_add(stdscr, 1, 2, f"{server.user}@{server.host}:{server.port}", curses.A_DIM)
+        core._safe_add(
+            stdscr,
+            2,
+            2,
+            "Enter run · ← / q back · paths in Edit (e)",
+            curses.color_pair(2),
         )
-        core._safe_add(stdscr, 3, 0, summary[: max(0, w - 1)], curses.A_DIM)
+        if status:
+            core._safe_add(stdscr, 3, 2, status[: max(0, w - 3)], curses.A_DIM)
 
-        top = 5
-        idx = max(0, min(idx, len(items) - 1))
-        for i, (_key, label, enabled) in enumerate(items):
-            y = top + i
+        summary = f"remote {server.web_remote or '—'}   local {server.web_local or '—'}"
+        core._safe_add(stdscr, 4, 2, summary[: max(0, w - 3)], curses.A_DIM)
+
+        top = 6
+        focus = max(0, min(focus, len(selectable) - 1))
+        for row_i, (kind, payload) in enumerate(display):
+            y = top + row_i
             if y >= h - 1:
                 break
-            selected = i == idx
+            if kind == "blank":
+                continue
+            if kind == "section":
+                # Gray group label
+                core._safe_add(
+                    stdscr,
+                    y,
+                    2,
+                    str(payload),
+                    curses.color_pair(8) | curses.A_BOLD,
+                )
+                continue
+
+            item_i = int(payload)
+            action_id, label, enabled = selectable[item_i]
+            selected = item_i == focus
             if selected and enabled:
                 try:
                     stdscr.addnstr(y, 0, " " * max(0, w - 1), w - 1, curses.color_pair(1))
@@ -500,24 +607,24 @@ def host_actions_menu(
             elif not enabled:
                 attr = curses.A_DIM
             else:
-                attr = curses.A_NORMAL
-            prefix = "  " if enabled else "  · "
+                attr = curses.color_pair(4) if action_id != "back" else curses.A_NORMAL
+            prefix = "    " if enabled else "    · "
             core._safe_add(stdscr, y, 0, (prefix + label)[: max(0, w - 1)], attr)
 
         stdscr.refresh()
         key = stdscr.getch()
         if key in (curses.KEY_UP, ord("k")):
-            idx = (idx - 1) % len(items)
+            focus = (focus - 1) % len(selectable)
         elif key in (curses.KEY_DOWN, ord("j")):
-            idx = (idx + 1) % len(items)
+            focus = (focus + 1) % len(selectable)
         elif key in (curses.KEY_LEFT, 27, ord("q")):
             return server
         elif key in (curses.KEY_ENTER, 10, 13):
-            action, _label, enabled = items[idx]
+            action, _label, enabled = selectable[focus]
             if action == "back":
                 return server
             if not enabled:
-                status = "Disabled — set paths/credentials in Edit (e), then reopen →."
+                status = "Disabled — set paths in Edit (e), then reopen →."
                 continue
             if action == "git_pull":
                 _suspend_curses(stdscr)
