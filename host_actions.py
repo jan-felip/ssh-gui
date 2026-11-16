@@ -94,6 +94,88 @@ def ssh_remote_capture(server: core.Server, remote_cmd: str, timeout: float = 60
     return _ssh_capture_with_password(argv, server.password or "", timeout)
 
 
+def _can_sudo(server: core.Server) -> bool:
+    """sudo -S needs the YAML host password."""
+    return bool(server.password)
+
+
+def wrap_sudo(remote_cmd: str, password: str) -> str:
+    """
+    Run remote_cmd via `sudo -S` (password on stdin, quiet prompt).
+    Uses bash -lc so pipelines/scripts work.
+    """
+    return (
+        f"printf '%s\\n' {shlex.quote(password)} | "
+        f"sudo -S -p '' bash -lc {shlex.quote(remote_cmd)}"
+    )
+
+
+def _looks_like_privilege_failure(code: int, out: str = "") -> bool:
+    if code == 0:
+        return False
+    low = (out or "").lower()
+    needles = (
+        "permission denied",
+        "operation not permitted",
+        "not permitted",
+        "access denied",
+        "must be root",
+        "password is required",
+        "a password is required",
+        "sudo:",
+    )
+    if any(n in low for n in needles):
+        return True
+    # Common non-zero exits when the user cannot read/traverse the path
+    return code in (1, 126, 127)
+
+
+def ssh_remote_capture_sudo_fallback(
+    server: core.Server,
+    remote_cmd: str,
+    timeout: float = 60.0,
+    *,
+    always_retry: bool = False,
+) -> Tuple[int, str, bool]:
+    """
+    Try remote_cmd without sudo; on failure retry with sudo -S when YAML
+    password is present (privilege-like errors, or always_retry=True for detect).
+    Returns (code, output, used_sudo).
+    """
+    code, out = ssh_remote_capture(server, remote_cmd, timeout=timeout)
+    if code == 0:
+        return code, out, False
+    if not _can_sudo(server):
+        return code, out, False
+    if not always_retry and not _looks_like_privilege_failure(code, out):
+        return code, out, False
+    assert server.password is not None
+    sudo_cmd = wrap_sudo(remote_cmd, server.password)
+    code2, out2 = ssh_remote_capture(server, sudo_cmd, timeout=timeout)
+    return code2, out2, True
+
+
+def ssh_remote_sudo_fallback(
+    server: core.Server,
+    remote_cmd: str,
+    interactive: bool = True,
+) -> Tuple[int, bool]:
+    """
+    Run remote_cmd; if it fails and YAML password exists, retry with sudo -S.
+    Returns (exit_code, used_sudo).
+    """
+    code = ssh_remote(server, remote_cmd, interactive=interactive)
+    if code == 0:
+        return code, False
+    if not _can_sudo(server):
+        return code, False
+    assert server.password is not None
+    print("  retrying with sudo -S …")
+    sudo_cmd = wrap_sudo(remote_cmd, server.password)
+    code2 = ssh_remote(server, sudo_cmd, interactive=interactive)
+    return code2, True
+
+
 def _exit_status_code(status: int) -> int:
     if hasattr(os, "waitstatus_to_exitcode"):
         return os.waitstatus_to_exitcode(status)
@@ -247,13 +329,15 @@ def remote_is_git(server: core.Server) -> bool:
     if not path:
         return False
     quoted = shlex.quote(path)
-    # Prefer explicit checks; avoid >/dev/null so password-PTY capture still sees activity.
-    # .git may be a dir or a gitfile (worktrees).
+    # Prefer explicit checks; .git may be a dir or a gitfile (worktrees).
     cmd = (
         f"if [ -e {quoted}/.git ] || git -C {quoted} rev-parse --is-inside-work-tree >/dev/null 2>&1; "
         f"then exit 0; else exit 1; fi"
     )
-    code, _out = ssh_remote_capture(server, cmd)
+    # Non-sudo first; if unreadability masks the repo, retry with sudo -S.
+    code, _out, _sudo = ssh_remote_capture_sudo_fallback(
+        server, cmd, always_retry=True
+    )
     return code == 0
 
 
@@ -348,17 +432,21 @@ def chmod_preset_cmd(web_remote: str) -> str:
 def action_fix_permissions(server: core.Server) -> None:
     if not server.web_remote:
         return
-    cmd = chmod_preset_cmd(server.web_remote)
+    remote = normalize_remote_path(server.web_remote)
+    cmd = chmod_preset_cmd(remote)
     print(f"→ Fix permissions on {server.label}")
     print(f"  preset: dirs {PERM_PRESET_DIRS}, files {PERM_PRESET_FILES}")
-    print(f"  remote: {server.web_remote}")
+    print(f"  remote: {remote}")
     print(f"  cmd: ssh … {cmd}")
+    print("  (non-sudo first; sudo -S fallback if password in YAML)")
     _pause("Press Enter to run (Ctrl+C abort)…")
     try:
-        code = ssh_remote(server, cmd, interactive=True)
+        code, used_sudo = ssh_remote_sudo_fallback(server, cmd, interactive=True)
     except KeyboardInterrupt:
         print("\nCancelled.")
-        code = 130
+        code, used_sudo = 130, False
+    if used_sudo:
+        print("  used: sudo -S")
     print(f"Exit: {code}")
     _pause()
 
@@ -400,7 +488,11 @@ def action_rsync_upload(server: core.Server) -> None:
     print(f"rsync exit: {code}")
     if code == 0:
         print("Applying permission preset…")
-        chmod_code = ssh_remote(server, chmod_preset_cmd(remote), interactive=True)
+        chmod_code, used_sudo = ssh_remote_sudo_fallback(
+            server, chmod_preset_cmd(normalize_remote_path(remote)), interactive=True
+        )
+        if used_sudo:
+            print("  chmod used: sudo -S")
         print(f"chmod exit: {chmod_code}")
     _pause()
 
@@ -409,7 +501,7 @@ def action_git_pull(server: core.Server) -> None:
     """Uses git_user/git_token from Edit/yaml when set. No settings prompts here."""
     if not server.web_remote:
         return
-    path_q = shlex.quote(server.web_remote)
+    path_q = shlex.quote(normalize_remote_path(server.web_remote))
 
     if server.git_user and server.git_token:
         u = urllib.parse.quote(server.git_user, safe="")
@@ -434,18 +526,21 @@ esac
         remote_script = f"set -e; cd {path_q}; git pull --ff-only"
 
     print(f"→ Git pull on {server.label}")
-    print(f"  path: {server.web_remote}")
+    print(f"  path: {normalize_remote_path(server.web_remote)}")
     if server.git_user:
         print(f"  git user: {server.git_user} (token: set)")
     else:
         print("  git auth: none in Edit (OK for public/SSH remotes)")
     print("  mode: git pull --ff-only")
+    print("  (non-sudo first; sudo -S fallback if password in YAML)")
     _pause("Press Enter to run (Ctrl+C abort)…")
     try:
-        code = ssh_remote(server, remote_script, interactive=True)
+        code, used_sudo = ssh_remote_sudo_fallback(server, remote_script, interactive=True)
     except KeyboardInterrupt:
         print("\nCancelled.")
-        code = 130
+        code, used_sudo = 130, False
+    if used_sudo:
+        print("  used: sudo -S")
     print(f"Exit: {code}")
     _pause()
 
@@ -453,18 +548,21 @@ esac
 def action_commit_history(server: core.Server, limit: int = 20) -> None:
     if not server.web_remote:
         return
-    path_q = shlex.quote(server.web_remote)
+    path_q = shlex.quote(normalize_remote_path(server.web_remote))
     fmt = shlex.quote("%h %ad %an %s")
     cmd = f"git -C {path_q} log -n {int(limit)} --date=short --pretty=format:{fmt}"
     print(f"→ Commit history on {server.label}")
-    print(f"  path: {server.web_remote}")
+    print(f"  path: {normalize_remote_path(server.web_remote)}")
     print(f"  cmd:  git log -n {limit} --pretty=…")
+    print("  (non-sudo first; sudo -S fallback if password in YAML)")
     _pause("Press Enter to run (Ctrl+C abort)…")
     try:
-        code = ssh_remote(server, cmd, interactive=True)
+        code, used_sudo = ssh_remote_sudo_fallback(server, cmd, interactive=True)
     except KeyboardInterrupt:
         print("\nCancelled.")
-        code = 130
+        code, used_sudo = 130, False
+    if used_sudo:
+        print("  used: sudo -S")
     print(f"\nExit: {code}")
     _pause()
 
