@@ -502,10 +502,14 @@ def _init_colors() -> None:
     curses.init_pair(5, curses.COLOR_GREEN, curses.COLOR_CYAN)  # [+] on cyan
     curses.init_pair(6, curses.COLOR_WHITE, curses.COLOR_CYAN)  # text on cyan
     curses.init_pair(7, curses.COLOR_RED, -1)  # errors / red mark / [-]
-    # Gray subtitle / search borders: prefer color 8 (bright black) when available
+    # Gray subtitle / search: prefer color 8 (bright black) when available.
+    # Same gray index for border bars and search fill so shades match (fg-on-default
+    # ▄ often looks lighter than the same index as a solid bg cell).
     gray = 8 if curses.COLORS >= 16 else curses.COLOR_WHITE
-    curses.init_pair(8, gray, -1)  # gray fg (▄/▀ borders, subtitle)
-    # Search middle: same gray as bg, white/light fg (not reverse, not bold)
+    curses.init_pair(8, gray, -1)  # gray fg on default (subtitle, dim text)
+    # Search borders: gray on gray → solid bar, same cell color as fill bg
+    curses.init_pair(17, gray, gray)
+    # Search middle: white fg on that same gray bg (no bold, no reverse)
     curses.init_pair(16, curses.COLOR_WHITE, gray)
     curses.init_pair(9, curses.COLOR_WHITE, curses.COLOR_RED)  # remove focused
     curses.init_pair(10, curses.COLOR_RED, curses.COLOR_RED)  # [-] on red bg
@@ -552,11 +556,10 @@ def _draw_search_box(
     Returns next free row.
     """
     box_w = max(8, term_w - 1)
-    border_attr = curses.color_pair(8)  # gray fg — same COLOR_GRAY index
-    if curses.COLORS < 16:
-        border_attr |= curses.A_DIM
-    # Pair 16: white fg on that same gray bg (no A_REVERSE, no A_BOLD)
-    mid_attr = curses.color_pair(16)
+    # Pair 17 = (gray, gray): ▄/▀ become solid bars in the same gray used as
+    # pair 16's background — avoids lighter glyph-fg vs darker solid-bg mismatch.
+    border_attr = curses.color_pair(17)
+    mid_attr = curses.color_pair(16)  # white on gray; no bold / no reverse
 
     _safe_add(stdscr, y, 0, "▄" * box_w, border_attr)
 
