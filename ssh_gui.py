@@ -604,7 +604,8 @@ def _draw_search_box(
     # Bottom empty charcoal row
     _safe_add(stdscr, y + 2, x0, fill, mute_attr)
 
-    return y + 3  # three charcoal rows; header starts next
+    # y+3 left unpainted (default/black) as a visual gap before the table header
+    return y + 4
 
 
 def _fit_cell(text: str, width: int) -> str:
@@ -1143,6 +1144,12 @@ def menu_loop(config_path: Path, dry_run: bool = False) -> Tuple[str, Optional[S
     """
 
     def _run(stdscr: "curses._CursesWindow") -> Tuple[str, Optional[Server]]:
+        # Cut ESC meta-key wait (default ~1000ms); arrows use keypad codes so they stay instant.
+        if hasattr(curses, "set_escdelay"):
+            try:
+                curses.set_escdelay(25)
+            except curses.error:
+                pass
         curses.curs_set(0)
         _init_colors()
         idx = 0
@@ -1451,6 +1458,9 @@ def add_host_cli(config_path: Path) -> int:
 
 
 def main(argv: Optional[List[str]] = None) -> int:
+    # Must be set before curses.initscr/wrapper reads it (ncurses ESCDELAY).
+    os.environ.setdefault("ESCDELAY", "25")
+
     args = parse_args(argv)
 
     if args.add:
