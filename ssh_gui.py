@@ -502,9 +502,11 @@ def _init_colors() -> None:
     curses.init_pair(5, curses.COLOR_GREEN, curses.COLOR_CYAN)  # [+] on cyan
     curses.init_pair(6, curses.COLOR_WHITE, curses.COLOR_CYAN)  # text on cyan
     curses.init_pair(7, curses.COLOR_RED, -1)  # errors / red mark / [-]
-    # Gray subtitle: prefer color 8 (bright black) when the terminal has it
+    # Gray subtitle / search borders: prefer color 8 (bright black) when available
     gray = 8 if curses.COLORS >= 16 else curses.COLOR_WHITE
-    curses.init_pair(8, gray, -1)
+    curses.init_pair(8, gray, -1)  # gray fg (▄/▀ borders, subtitle)
+    # Search middle: same gray as bg, white/light fg (not reverse, not bold)
+    curses.init_pair(16, curses.COLOR_WHITE, gray)
     curses.init_pair(9, curses.COLOR_WHITE, curses.COLOR_RED)  # remove focused
     curses.init_pair(10, curses.COLOR_RED, curses.COLOR_RED)  # [-] on red bg
     curses.init_pair(11, curses.COLOR_WHITE, curses.COLOR_GREEN)  # save focused
@@ -550,13 +552,11 @@ def _draw_search_box(
     Returns next free row.
     """
     box_w = max(8, term_w - 1)
-    # Same gray pair as ▄/▀ borders (pair 8). Reverse puts that gray on the
-    # background so the middle matches the border shade exactly.
-    gray = curses.color_pair(8)
+    border_attr = curses.color_pair(8)  # gray fg — same COLOR_GRAY index
     if curses.COLORS < 16:
-        gray |= curses.A_DIM
-    border_attr = gray
-    mid_attr = gray | curses.A_REVERSE | curses.A_BOLD
+        border_attr |= curses.A_DIM
+    # Pair 16: white fg on that same gray bg (no A_REVERSE, no A_BOLD)
+    mid_attr = curses.color_pair(16)
 
     _safe_add(stdscr, y, 0, "▄" * box_w, border_attr)
 
