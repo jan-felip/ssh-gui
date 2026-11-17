@@ -30,11 +30,20 @@ def _resume_curses(stdscr: "curses._CursesWindow") -> None:
     stdscr.refresh()
 
 
-def _pause(msg: str = "Press Enter to continue…") -> None:
+_CANCEL_HINT = "Cancelled. Press Esc or ← to leave the actions menu."
+_RUN_KEYS_NOTE = "keys:  Enter to run · Esc / ← in menu to cancel"
+
+
+def _pause(msg: str = "Press Enter to continue…") -> bool:
+    """Return False if cancelled (Ctrl+C). Never raises KeyboardInterrupt."""
     try:
         input(msg)
+        return True
     except EOFError:
-        pass
+        return True
+    except KeyboardInterrupt:
+        print(f"\n{_CANCEL_HINT}")
+        return False
 
 
 # ANSI helpers for suspended-curses stdout panels (TTY only).
@@ -84,12 +93,15 @@ def _print_error_panel(title: str, details: List[str], output: str) -> None:
 
 
 def _confirm_yn(prompt: str, *, default_yes: bool = False) -> bool:
-    """Ask (y/N) or (Y/n). Empty input uses default. Default for rsync is N."""
+    """Ask (y/N) or (Y/n). Empty input uses default. Ctrl+C → False (cancel)."""
     suffix = " [Y/n]: " if default_yes else " [y/N]: "
     try:
         ans = input(prompt + suffix).strip().lower()
     except EOFError:
         return default_yes
+    except KeyboardInterrupt:
+        print(f"\n{_CANCEL_HINT}")
+        return False
     if not ans:
         return default_yes
     return ans in ("y", "yes")
@@ -423,11 +435,18 @@ def action_drush(server: core.Server, title: str, drush_args: str) -> None:
         f"cd {path_q} && source {shlex.quote(REMI_PHP_ENABLE)} && "
         f"vendor/bin/drush {drush_args}"
     )
-    print(f"→ {title} on {server.label}")
-    print(f"  path: {path}")
-    print(f"  cmd:  vendor/bin/drush {drush_args}")
-    print("  (non-sudo first; sudo -S fallback; then Remi PHP enable retry)")
-    _pause("Press Enter to run (Ctrl+C abort)…")
+    _print_info_panel(
+        title,
+        [
+            f"host:  {server.label}",
+            f"path:  {path}",
+            f"cmd:   vendor/bin/drush {drush_args}",
+            "note:  plain → sudo (if YAML pass) → Remi php81 enable (+ sudo)",
+            _RUN_KEYS_NOTE,
+        ],
+    )
+    if not _pause("Press Enter to run…"):
+        return
     used_sudo = False
     used_remi = False
     out = ""
@@ -445,14 +464,14 @@ def action_drush(server: core.Server, title: str, drush_args: str) -> None:
                 print(out.rstrip())
                 print()
     except KeyboardInterrupt:
-        print("\nCancelled.")
-        code = 130
+        print(f"\n{_CANCEL_HINT}")
+        return
     if used_remi:
         print(f"  used: source {REMI_PHP_ENABLE}")
     if used_sudo:
         print("  used: sudo -S")
     print(f"Exit: {code}")
-    if code not in (0, 130):
+    if code != 0:
         last_cmd = remi_cmd if used_remi else cmd
         _print_error_panel(
             f"{title} failed",
@@ -564,17 +583,23 @@ def action_fix_permissions(server: core.Server) -> None:
         return
     remote = normalize_remote_path(server.web_remote)
     cmd = chmod_preset_cmd(remote)
-    print(f"→ Fix permissions on {server.label}")
-    print(f"  preset: dirs {PERM_PRESET_DIRS}, files {PERM_PRESET_FILES}")
-    print(f"  remote: {remote}")
-    print(f"  cmd: ssh … {cmd}")
-    print("  (non-sudo first; sudo -S fallback if password in YAML)")
-    _pause("Press Enter to run (Ctrl+C abort)…")
+    _print_info_panel(
+        "Fix permissions",
+        [
+            f"host:    {server.label}",
+            f"remote:  {remote}",
+            f"preset:  dirs {PERM_PRESET_DIRS} / files {PERM_PRESET_FILES}",
+            "note:    non-sudo first; sudo -S fallback if password in YAML",
+            _RUN_KEYS_NOTE,
+        ],
+    )
+    if not _pause("Press Enter to run…"):
+        return
     try:
         code, used_sudo = ssh_remote_sudo_fallback(server, cmd, interactive=True)
     except KeyboardInterrupt:
-        print("\nCancelled.")
-        code, used_sudo = 130, False
+        print(f"\n{_CANCEL_HINT}")
+        return
     if used_sudo:
         print("  used: sudo -S")
     print(f"Exit: {code}")
@@ -604,26 +629,33 @@ def action_rsync_upload(server: core.Server) -> None:
         src,
         dest,
     ]
-    print(f"→ Upload (rsync) to {server.label}")
-    print(f"  local:  {src}")
-    print(f"  remote: {dest}")
-    print(f"  cmd:    {' '.join(shlex.quote(a) for a in argv)}")
-    print(f"  after:  chmod dirs {PERM_PRESET_DIRS} / files {PERM_PRESET_FILES}")
+    _print_info_panel(
+        "Rsync upload + fix permissions",
+        [
+            f"host:    {server.label}",
+            f"local:   {src}",
+            f"remote:  {dest}",
+            f"after:   chmod dirs {PERM_PRESET_DIRS} / files {PERM_PRESET_FILES}",
+            "confirm: y to run · Enter/N cancels · Esc / ← in menu to leave",
+        ],
+    )
     if not _confirm_yn("Run upload rsync+chmod?", default_yes=False):
-        print("Cancelled.")
-        _pause()
         return
     try:
         code = run_argv(argv, server, interactive=True)
     except KeyboardInterrupt:
-        print("\nCancelled.")
-        code = 130
+        print(f"\n{_CANCEL_HINT}")
+        return
     print(f"rsync exit: {code}")
     if code == 0:
         print("Applying permission preset…")
-        chmod_code, used_sudo = ssh_remote_sudo_fallback(
-            server, chmod_preset_cmd(normalize_remote_path(remote)), interactive=True
-        )
+        try:
+            chmod_code, used_sudo = ssh_remote_sudo_fallback(
+                server, chmod_preset_cmd(normalize_remote_path(remote)), interactive=True
+            )
+        except KeyboardInterrupt:
+            print(f"\n{_CANCEL_HINT}")
+            return
         if used_sudo:
             print("  chmod used: sudo -S")
         print(f"chmod exit: {chmod_code}")
@@ -668,13 +700,15 @@ esac
     else:
         info_lines.append("auth:  none in Edit (OK for public/SSH remotes)")
     info_lines.append("note:  non-sudo first; sudo -S fallback if password in YAML")
+    info_lines.append(_RUN_KEYS_NOTE)
     _print_info_panel("Git pull", info_lines)
-    _pause("Press Enter to run (Ctrl+C abort)…")
+    if not _pause("Press Enter to run…"):
+        return
     try:
         code, used_sudo = ssh_remote_sudo_fallback(server, remote_script, interactive=True)
     except KeyboardInterrupt:
-        print("\nCancelled.")
-        code, used_sudo = 130, False
+        print(f"\n{_CANCEL_HINT}")
+        return
     if used_sudo:
         print("  used: sudo -S")
     print(f"Exit: {code}")
@@ -694,19 +728,20 @@ def action_commit_history(server: core.Server, limit: int = 20) -> None:
             f"path:  {normalize_remote_path(server.web_remote)}",
             f"cmd:   git log -n {limit} --pretty=…",
             "note:  non-sudo first; sudo -S fallback if password in YAML",
+            _RUN_KEYS_NOTE,
         ],
     )
-    _pause("Press Enter to run (Ctrl+C abort)…")
+    if not _pause("Press Enter to run…"):
+        return
     try:
         code, used_sudo = ssh_remote_sudo_fallback(server, cmd, interactive=True)
     except KeyboardInterrupt:
-        print("\nCancelled.")
-        code, used_sudo = 130, False
+        print(f"\n{_CANCEL_HINT}")
+        return
     if used_sudo:
         print("  used: sudo -S")
     print(f"\nExit: {code}")
     _pause()
-
 
 
 def action_rsync_download(server: core.Server) -> None:
@@ -737,19 +772,22 @@ def action_rsync_download(server: core.Server) -> None:
         src,
         dest,
     ]
-    print(f"→ Download (rsync) from {server.label}")
-    print(f"  remote: {src}")
-    print(f"  local:  {dest}")
-    print(f"  cmd:    {' '.join(shlex.quote(a) for a in argv)}")
+    _print_info_panel(
+        "Rsync download",
+        [
+            f"host:    {server.label}",
+            f"remote:  {src}",
+            f"local:   {dest}",
+            "confirm: y to run · Enter/N cancels · Esc / ← in menu to leave",
+        ],
+    )
     if not _confirm_yn("Run download rsync?", default_yes=False):
-        print("Cancelled.")
-        _pause()
         return
     try:
         code = run_argv(argv, server, interactive=True)
     except KeyboardInterrupt:
-        print("\nCancelled.")
-        code = 130
+        print(f"\n{_CANCEL_HINT}")
+        return
     print(f"rsync exit: {code}")
     _pause()
 
