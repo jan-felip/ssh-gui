@@ -334,23 +334,55 @@ def normalize_remote_path(path: str) -> str:
     return p
 
 
-def remote_is_git(server: core.Server) -> bool:
+def remote_detect_flags(server: core.Server) -> Tuple[bool, bool]:
+    """Return (is_git, has_vendor) for web_remote. Non-sudo first, then sudo -S."""
     if not server.web_remote:
-        return False
+        return False, False
     path = normalize_remote_path(server.web_remote)
     if not path:
-        return False
+        return False, False
     quoted = shlex.quote(path)
     # Prefer explicit checks; .git may be a dir or a gitfile (worktrees).
     cmd = (
+        f"git=0; vendor=0; "
         f"if [ -e {quoted}/.git ] || git -C {quoted} rev-parse --is-inside-work-tree >/dev/null 2>&1; "
-        f"then exit 0; else exit 1; fi"
+        f"then git=1; fi; "
+        f"if [ -d {quoted}/vendor ]; then vendor=1; fi; "
+        f"printf 'GIT=%s VENDOR=%s\\n' \"$git\" \"$vendor\""
     )
-    # Non-sudo first; if unreadability masks the repo, retry with sudo -S.
-    code, _out, _sudo = ssh_remote_capture_sudo_fallback(
+    code, out, _sudo = ssh_remote_capture_sudo_fallback(
         server, cmd, always_retry=True
     )
-    return code == 0
+    if code != 0:
+        return False, False
+    return ("GIT=1" in out), ("VENDOR=1" in out)
+
+
+def remote_is_git(server: core.Server) -> bool:
+    return remote_detect_flags(server)[0]
+
+
+def action_drush(server: core.Server, title: str, drush_args: str) -> None:
+    """Run vendor/bin/drush <args> in web_remote (sudo fallback OK)."""
+    if not server.web_remote:
+        return
+    path = normalize_remote_path(server.web_remote)
+    path_q = shlex.quote(path)
+    cmd = f"cd {path_q} && vendor/bin/drush {drush_args}"
+    print(f"→ {title} on {server.label}")
+    print(f"  path: {path}")
+    print(f"  cmd:  vendor/bin/drush {drush_args}")
+    print("  (non-sudo first; sudo -S fallback if password in YAML)")
+    _pause("Press Enter to run (Ctrl+C abort)…")
+    try:
+        code, used_sudo = ssh_remote_sudo_fallback(server, cmd, interactive=True)
+    except KeyboardInterrupt:
+        print("\nCancelled.")
+        code, used_sudo = 130, False
+    if used_sudo:
+        print("  used: sudo -S")
+    print(f"Exit: {code}")
+    _pause()
 
 
 def pick_local_directory(
@@ -641,6 +673,7 @@ def host_actions_menu(
     focus = 0  # index into selectable action list
     status = ""
     is_git: Optional[bool] = None
+    has_vendor: Optional[bool] = None
     detected = False
 
     while True:
@@ -655,20 +688,25 @@ def host_actions_menu(
         can_chmod = has_remote
 
         if has_remote and not detected:
-            status = "Detecting remote git…"
+            status = "Detecting remote git / vendor…"
             stdscr.clear()
             core._safe_add(stdscr, 0, 2, server.name, curses.color_pair(4) | curses.A_BOLD)
             core._safe_add(stdscr, 2, 2, status, curses.color_pair(2))
             stdscr.refresh()
             try:
-                is_git = remote_is_git(server)
-                status = "Remote git repo detected." if is_git else "Remote path is not a git work tree."
+                is_git, has_vendor = remote_detect_flags(server)
+                bits = []
+                bits.append("git" if is_git else "no git")
+                bits.append("vendor" if has_vendor else "no vendor")
+                status = "Remote: " + ", ".join(bits) + "."
             except Exception as exc:  # noqa: BLE001
                 is_git = False
-                status = f"Git detect failed: {exc}"
+                has_vendor = False
+                status = f"Detect failed: {exc}"
             detected = True
         elif not has_remote:
             is_git = False
+            has_vendor = False
             status = "Set web_remote (and web_local) in Edit (e) to enable actions."
 
         # Selectable actions only (section labels are visual)
@@ -700,21 +738,38 @@ def host_actions_menu(
         else:
             deploy_actions.append(("chmod", "Fix permissions only  (set web_remote in Edit)", False))
 
+        # Vendor group only when remote web_remote/vendor exists
+        vendor_actions: List[Tuple[str, str, bool]] = []
+        if has_vendor:
+            vendor_actions = [
+                ("drush_cr", "Rebuild cache", True),
+                ("drush_uli", "Admin login", True),
+                ("drush_cim", "Config: Import", True),
+                ("drush_cex", "Config: Export", True),
+            ]
+
         selectable: List[Tuple[str, str, bool]] = [
             *git_actions,
             *deploy_actions,
+            *vendor_actions,
             ("back", "← Back to host list", True),
         ]
 
         # Display rows: ('section', title) | ('item', selectable_index)
+        git_n = len(git_actions)
+        deploy_n = len(deploy_actions)
+        vendor_n = len(vendor_actions)
         display: List[Tuple[str, Any]] = [
             ("section", "Git"),
-            *[("item", i) for i in range(len(git_actions))],
+            *[("item", i) for i in range(git_n)],
             ("section", "Deploy"),
-            *[("item", len(git_actions) + i) for i in range(len(deploy_actions))],
-            ("blank", None),
-            ("item", len(selectable) - 1),  # back
+            *[("item", git_n + i) for i in range(deploy_n)],
         ]
+        if vendor_n:
+            display.append(("section", "Vendor"))
+            display.extend(("item", git_n + deploy_n + i) for i in range(vendor_n))
+        display.append(("blank", None))
+        display.append(("item", len(selectable) - 1))  # back
 
         stdscr.clear()
         h, w = stdscr.getmaxyx()
@@ -825,3 +880,31 @@ def host_actions_menu(
                 finally:
                     _resume_curses(stdscr)
                 status = "Permissions fix finished."
+            elif action == "drush_cr":
+                _suspend_curses(stdscr)
+                try:
+                    action_drush(server, "Rebuild cache", "cr")
+                finally:
+                    _resume_curses(stdscr)
+                status = "Rebuild cache finished."
+            elif action == "drush_uli":
+                _suspend_curses(stdscr)
+                try:
+                    action_drush(server, "Admin login", "uli")
+                finally:
+                    _resume_curses(stdscr)
+                status = "Admin login finished."
+            elif action == "drush_cim":
+                _suspend_curses(stdscr)
+                try:
+                    action_drush(server, "Config: Import", "cim")
+                finally:
+                    _resume_curses(stdscr)
+                status = "Config import finished."
+            elif action == "drush_cex":
+                _suspend_curses(stdscr)
+                try:
+                    action_drush(server, "Config: Export", "cex")
+                finally:
+                    _resume_curses(stdscr)
+                status = "Config export finished."
