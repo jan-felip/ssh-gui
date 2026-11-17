@@ -55,7 +55,7 @@ _ANSI_GREEN = "\033[1;32m"
 _ANSI_YELLOW = "\033[1;33m"
 _ANSI_CYAN = "\033[1;36m"
 _ANSI_CYAN_DIM = "\033[0;36m"
-_ANSI_SUCCESS_TAG = "\033[30;42m"  # black on green
+_ANSI_SUCCESS_TAG = "\033[1;30;42m"  # bold black on green
 
 _GIT_FILE_STAT_RE = re.compile(r"\|\s*\d+\s+([+\-]+)\s*$")
 
