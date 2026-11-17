@@ -55,8 +55,7 @@ _ANSI_GREEN = "\033[1;32m"
 _ANSI_YELLOW = "\033[1;33m"
 _ANSI_CYAN = "\033[1;36m"
 _ANSI_CYAN_DIM = "\033[0;36m"
-_ANSI_SUCCESS_TAG = "\033[1;37;42m"  # bold white on green
-_ANSI_SUCCESS_REST = "\033[1;37;40m"  # bold white on black
+_ANSI_SUCCESS_TAG = "\033[30;42m"  # black on green
 
 _GIT_FILE_STAT_RE = re.compile(r"\|\s*\d+\s+([+\-]+)\s*$")
 
@@ -560,11 +559,11 @@ def _print_red_block(lines: List[str]) -> None:
 
 
 def _print_success_line(line: str) -> None:
-    """[success] white on green; rest of line white on black."""
+    """[success] black on green; rest of line uses default terminal colors."""
     text = line.rstrip("\n")
     m = _DRUSH_SUCCESS_RE.search(text)
     if not m:
-        print(_c(_ANSI_GREEN, text))
+        print(text)
         return
     before = text[: m.start()]
     tag = text[m.start() : m.end()]
@@ -572,10 +571,7 @@ def _print_success_line(line: str) -> None:
     if not sys.stdout.isatty():
         print(text)
         return
-    print(
-        f"{before}{_ANSI_SUCCESS_TAG}{tag}{_ANSI_RST}"
-        f"{_ANSI_SUCCESS_REST}{after}{_ANSI_RST}"
-    )
+    print(f"{before}{_ANSI_SUCCESS_TAG}{tag}{_ANSI_RST}{after}")
 
 
 def _print_drush_output_line(line: str, *, quiet: bool = False) -> None:
