@@ -75,7 +75,7 @@ Runtime only — no path settings here. Missing config shows as disabled with a 
 | Git pull | `web_remote` is a git work tree |
 | Commit history | same (`git log` short on remote) |
 | Upload (rsync) + fix permissions | both `web_local` and `web_remote` set |
-| Download (rsync, live dual-pane) | same — remote → local with FTP2P-style preview |
+| Download (rsync) | same — remote → local (simple rsync progress like upload) |
 | Fix permissions only | `web_remote` set |
 | ← / q | Back to host list |
 
@@ -83,7 +83,7 @@ Runtime only — no path settings here. Missing config shows as disabled with a 
 
 Each enabled run prints the command and waits for Enter before executing.
 
-**Permission preset:** after a successful rsync (and via “Fix permissions only”):
+**Permission preset:** after a successful upload rsync (and via “Fix permissions only”):
 
 ```bash
 find <web_remote> -type d -exec chmod 755 {} +
