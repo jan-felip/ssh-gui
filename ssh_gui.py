@@ -12,6 +12,7 @@ import os
 import pty
 import re
 import select
+import shlex
 import signal
 import struct
 import sys
@@ -253,7 +254,15 @@ def build_ssh_argv(server: Server) -> List[str]:
                 "NumberOfPasswordPrompts=1",
             ]
         )
+    remote_cd = (server.web_remote or "").strip()
+    if len(remote_cd) > 1:
+        remote_cd = remote_cd.rstrip("/")
+    if remote_cd:
+        ssh.append("-t")
     ssh.append(f"{server.user}@{server.host}")
+    if remote_cd:
+        # Start interactive shell in web_remote when set.
+        ssh.append(f"cd {shlex.quote(remote_cd)} && exec $SHELL -l")
     return ssh
 
 
