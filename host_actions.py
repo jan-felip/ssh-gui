@@ -7,6 +7,7 @@ import curses
 import os
 import shlex
 import subprocess
+import sys
 import urllib.parse
 from pathlib import Path
 from typing import Any, List, Optional, Tuple
@@ -34,6 +35,52 @@ def _pause(msg: str = "Press Enter to continue…") -> None:
         input(msg)
     except EOFError:
         pass
+
+
+# ANSI helpers for suspended-curses stdout panels (TTY only).
+_ANSI_RST = "\033[0m"
+_ANSI_RED = "\033[1;31m"
+_ANSI_CYAN = "\033[1;36m"
+_ANSI_CYAN_DIM = "\033[0;36m"
+
+
+def _c(code: str, text: str) -> str:
+    if not sys.stdout.isatty():
+        return text
+    return f"{code}{text}{_ANSI_RST}"
+
+
+def _print_info_panel(title: str, lines: List[str]) -> None:
+    """Blank / asterisks / colored info / asterisks / blank — intentional confirm look."""
+    bar = "*" * 56
+    print()
+    print(_c(_ANSI_CYAN, bar))
+    print(_c(_ANSI_CYAN, f"  {title}"))
+    print(_c(_ANSI_CYAN, bar))
+    print()
+    for line in lines:
+        print(_c(_ANSI_CYAN_DIM, f"  {line}"))
+    print()
+    print(_c(_ANSI_CYAN, bar))
+    print()
+
+
+def _print_error_panel(title: str, details: List[str], output: str) -> None:
+    """Clear RED failure block with pasteable command output."""
+    bar = "*" * 56
+    print()
+    print(_c(_ANSI_RED, bar))
+    print(_c(_ANSI_RED, f"  ERROR: {title}"))
+    print(_c(_ANSI_RED, bar))
+    print()
+    for line in details:
+        print(_c(_ANSI_RED, f"  {line}"))
+    print()
+    body = (output or "").rstrip() or "(no command output / stderr captured)"
+    print(_c(_ANSI_RED, body))
+    print()
+    print(_c(_ANSI_RED, bar))
+    print()
 
 
 def _confirm_yn(prompt: str, *, default_yes: bool = False) -> bool:
@@ -383,15 +430,20 @@ def action_drush(server: core.Server, title: str, drush_args: str) -> None:
     _pause("Press Enter to run (Ctrl+C abort)…")
     used_sudo = False
     used_remi = False
+    out = ""
     try:
         code, used_sudo = ssh_remote_sudo_fallback(server, cmd, interactive=True)
         if code != 0:
             print(f"  retrying after source {REMI_PHP_ENABLE} …")
-            code, used_sudo2 = ssh_remote_sudo_fallback(
-                server, remi_cmd, interactive=True
+            # Capture so we can show a pasteable RED error if this also fails.
+            code, out, used_sudo2 = ssh_remote_capture_sudo_fallback(
+                server, remi_cmd, timeout=180.0, always_retry=True
             )
             used_sudo = used_sudo or used_sudo2
             used_remi = True
+            if out.strip():
+                print(out.rstrip())
+                print()
     except KeyboardInterrupt:
         print("\nCancelled.")
         code = 130
@@ -400,6 +452,22 @@ def action_drush(server: core.Server, title: str, drush_args: str) -> None:
     if used_sudo:
         print("  used: sudo -S")
     print(f"Exit: {code}")
+    if code not in (0, 130):
+        last_cmd = remi_cmd if used_remi else cmd
+        _print_error_panel(
+            f"{title} failed",
+            [
+                f"host: {server.label}",
+                f"path: {path}",
+                f"exit: {code}",
+                f"cmd:  {last_cmd}",
+                "Tried: plain → sudo (if YAML pass) → Remi php81 enable (+ sudo).",
+                "Copy the output below for debugging.",
+            ],
+            out,
+        )
+        _pause("Press Enter to return…")
+        return
     _pause()
 
 
@@ -590,14 +658,17 @@ esac
     else:
         remote_script = f"set -e; cd {path_q}; git pull --ff-only"
 
-    print(f"→ Git pull on {server.label}")
-    print(f"  path: {normalize_remote_path(server.web_remote)}")
+    info_lines = [
+        f"host:  {server.label}",
+        f"path:  {normalize_remote_path(server.web_remote)}",
+        f"mode:  git pull --ff-only",
+    ]
     if server.git_user:
-        print(f"  git user: {server.git_user} (token: set)")
+        info_lines.append(f"auth:  {server.git_user} (token: set)")
     else:
-        print("  git auth: none in Edit (OK for public/SSH remotes)")
-    print("  mode: git pull --ff-only")
-    print("  (non-sudo first; sudo -S fallback if password in YAML)")
+        info_lines.append("auth:  none in Edit (OK for public/SSH remotes)")
+    info_lines.append("note:  non-sudo first; sudo -S fallback if password in YAML")
+    _print_info_panel("Git pull", info_lines)
     _pause("Press Enter to run (Ctrl+C abort)…")
     try:
         code, used_sudo = ssh_remote_sudo_fallback(server, remote_script, interactive=True)
@@ -616,10 +687,15 @@ def action_commit_history(server: core.Server, limit: int = 20) -> None:
     path_q = shlex.quote(normalize_remote_path(server.web_remote))
     fmt = shlex.quote("%h %ad %an %s")
     cmd = f"git -C {path_q} log -n {int(limit)} --date=short --pretty=format:{fmt}"
-    print(f"→ Commit history on {server.label}")
-    print(f"  path: {normalize_remote_path(server.web_remote)}")
-    print(f"  cmd:  git log -n {limit} --pretty=…")
-    print("  (non-sudo first; sudo -S fallback if password in YAML)")
+    _print_info_panel(
+        "Git history",
+        [
+            f"host:  {server.label}",
+            f"path:  {normalize_remote_path(server.web_remote)}",
+            f"cmd:   git log -n {limit} --pretty=…",
+            "note:  non-sudo first; sudo -S fallback if password in YAML",
+        ],
+    )
     _pause("Press Enter to run (Ctrl+C abort)…")
     try:
         code, used_sudo = ssh_remote_sudo_fallback(server, cmd, interactive=True)
