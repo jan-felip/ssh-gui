@@ -512,12 +512,64 @@ def _init_colors() -> None:
     curses.init_pair(13, curses.COLOR_BLACK, curses.COLOR_CYAN)  # asterisk on selected row
     curses.init_pair(14, curses.COLOR_YELLOW, -1)  # [-] discard
     curses.init_pair(15, curses.COLOR_WHITE, curses.COLOR_YELLOW)  # discard focused
+    # Search box: white text on gray background
+    gray_bg = 8 if curses.COLORS >= 16 else curses.COLOR_BLACK
+    curses.init_pair(16, curses.COLOR_WHITE, gray_bg)
+
+
+# ⌕ U+2315 TELEPHONE RECORDER — classic single-cell magnifier in macOS Terminal
+SEARCH_GLYPH = "\u2315"
 
 
 def _menu_items(servers: List[Server]) -> List[MenuItem]:
     items: List[MenuItem] = list(servers)
     items.append(ADD_ACTION)
     return items
+
+
+def _filter_servers(servers: List[Server], query: str) -> List[Server]:
+    q = (query or "").strip().lower()
+    if not q:
+        return list(servers)
+    out: List[Server] = []
+    for s in servers:
+        blob = f"{s.name} {s.host} {s.notes or ''}".lower()
+        if q in blob:
+            out.append(s)
+    return out
+
+
+def _draw_search_box(
+    stdscr: "curses._CursesWindow",
+    y: int,
+    term_w: int,
+    query: str,
+) -> int:
+    """
+    Full-width adaptive search box:
+      ▄▄▄…  (gray top)
+      ⌕ query… on gray bg / white text
+      ▀▀▀…  (gray bottom)
+    Returns next free row.
+    """
+    box_w = max(8, term_w - 1)
+    border_attr = curses.color_pair(8)
+    if curses.COLORS < 16:
+        border_attr |= curses.A_DIM
+    mid_attr = curses.color_pair(16) | curses.A_BOLD
+
+    _safe_add(stdscr, y, 0, "▄" * box_w, border_attr)
+
+    # glyph + space + query; pad to full width on gray
+    prefix = f" {SEARCH_GLYPH} "
+    avail = max(0, box_w - len(prefix))
+    shown = query[-avail:] if len(query) > avail else query
+    pad = max(0, box_w - len(prefix) - len(shown))
+    middle = prefix + shown + (" " * pad)
+    _safe_add(stdscr, y + 1, 0, middle[:box_w], mid_attr)
+
+    _safe_add(stdscr, y + 2, 0, "▀" * box_w, border_attr)
+    return y + 3
 
 
 def _fit_cell(text: str, width: int) -> str:
@@ -1059,6 +1111,8 @@ def menu_loop(config_path: Path, dry_run: bool = False) -> Tuple[str, Optional[S
         curses.curs_set(0)
         _init_colors()
         idx = 0
+        search_open = False
+        search_query = ""
 
         while True:
             try:
@@ -1075,7 +1129,12 @@ def menu_loop(config_path: Path, dry_run: bool = False) -> Tuple[str, Optional[S
                 stdscr.getch()
                 return ("quit", None)
 
-            items = _menu_items(servers)
+            visible_servers = (
+                _filter_servers(servers, search_query) if search_open else servers
+            )
+            items = _menu_items(visible_servers)
+            if idx >= len(items):
+                idx = max(0, len(items) - 1)
             # Visual rows: servers, blank separator (if any servers), add action
             # Navigation index maps over items only (not the blank line)
 
@@ -1083,8 +1142,12 @@ def menu_loop(config_path: Path, dry_run: bool = False) -> Tuple[str, Optional[S
             h, w = stdscr.getmaxyx()
             list_top = draw_banner(stdscr, h, w)
 
-            name_w, host_w, notes_w = _column_widths(servers, w)
-            show_header = bool(servers) and (h - list_top) > 2
+            # Search box between title and table header (only while open)
+            if search_open:
+                list_top = _draw_search_box(stdscr, list_top, w, search_query)
+
+            name_w, host_w, notes_w = _column_widths(visible_servers, w)
+            show_header = bool(visible_servers) and (h - list_top) > 2
             content_top = list_top
             if show_header:
                 header = format_header_row(name_w, host_w, notes_w)
@@ -1102,7 +1165,7 @@ def menu_loop(config_path: Path, dry_run: bool = False) -> Tuple[str, Optional[S
             display_rows: List[Tuple[Optional[int], str]] = []
             for i, item in enumerate(items):
                 if item == ADD_ACTION:
-                    if servers:
+                    if visible_servers:
                         display_rows.append((None, "blank"))
                     display_rows.append((i, "add"))
                 else:
@@ -1137,12 +1200,42 @@ def menu_loop(config_path: Path, dry_run: bool = False) -> Tuple[str, Optional[S
 
             stdscr.refresh()
             key = stdscr.getch()
-            n = len(items)
-            if key in (curses.KEY_UP, ord("k")):
+            n = len(items) if items else 1
+
+            # Esc: close/clear search if open, else quit
+            if key == 27:
+                if search_open:
+                    search_open = False
+                    search_query = ""
+                    idx = 0
+                    continue
+                return ("quit", None)
+
+            # Search box input
+            if search_open and key in (curses.KEY_BACKSPACE, 127, 8):
+                search_query = search_query[:-1]
+                idx = 0
+                continue
+            if 32 <= key <= 126:
+                ch = chr(key)
+                if search_open:
+                    search_query += ch
+                    idx = 0
+                    continue
+                # Closed: keep e/j/k/q as shortcuts; any other printable opens search
+                if ch.lower() not in ("e", "j", "k", "q"):
+                    search_open = True
+                    search_query = ch
+                    idx = 0
+                    continue
+
+            if key == curses.KEY_UP or (not search_open and key == ord("k")):
                 idx = (idx - 1) % n
-            elif key in (curses.KEY_DOWN, ord("j")):
+                continue
+            if key == curses.KEY_DOWN or (not search_open and key == ord("j")):
                 idx = (idx + 1) % n
-            elif key == curses.KEY_RIGHT:
+                continue
+            if key == curses.KEY_RIGHT:
                 chosen = items[idx]
                 if chosen == ADD_ACTION:
                     continue
@@ -1229,7 +1322,7 @@ def menu_loop(config_path: Path, dry_run: bool = False) -> Tuple[str, Optional[S
                         idx = i
                         break
                 continue
-            elif key in (ord("q"), 27):
+            elif key in (ord("q"), ord("Q")):
                 return ("quit", None)
 
     return curses.wrapper(_run)
