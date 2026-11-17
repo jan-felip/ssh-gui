@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import curses
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -49,14 +50,72 @@ def _pause(msg: str = "Press Enter to continue…") -> bool:
 # ANSI helpers for suspended-curses stdout panels (TTY only).
 _ANSI_RST = "\033[0m"
 _ANSI_RED = "\033[1;31m"
+_ANSI_GREEN = "\033[1;32m"
+_ANSI_YELLOW = "\033[1;33m"
 _ANSI_CYAN = "\033[1;36m"
 _ANSI_CYAN_DIM = "\033[0;36m"
+
+_GIT_FILE_STAT_RE = re.compile(r"\|\s*\d+\s+([+\-]+)\s*$")
 
 
 def _c(code: str, text: str) -> str:
     if not sys.stdout.isatty():
         return text
     return f"{code}{text}{_ANSI_RST}"
+
+
+def _colorize_git_pull_line(line: str) -> str:
+    """Green add, red delete, yellow modify; everything else yellow."""
+    s = line.rstrip("\n")
+    stripped = s.lstrip()
+    low = stripped.lower()
+
+    if stripped.startswith("+++") or stripped.startswith("---"):
+        return _c(_ANSI_YELLOW, s)
+    if stripped.startswith("+"):
+        return _c(_ANSI_GREEN, s)
+    if stripped.startswith("-"):
+        return _c(_ANSI_RED, s)
+
+    if "create mode" in low or "new file" in low or "[new branch]" in low:
+        return _c(_ANSI_GREEN, s)
+    if "delete mode" in low or "deleted file" in low or "deleted branch" in low:
+        return _c(_ANSI_RED, s)
+
+    m = _GIT_FILE_STAT_RE.search(stripped)
+    if m:
+        marks = m.group(1)
+        has_plus = "+" in marks
+        has_minus = "-" in marks
+        if has_plus and not has_minus:
+            return _c(_ANSI_GREEN, s)
+        if has_minus and not has_plus:
+            return _c(_ANSI_RED, s)
+        return _c(_ANSI_YELLOW, s)
+
+    if "insertion" in low and "deletion" not in low:
+        return _c(_ANSI_GREEN, s)
+    if "deletion" in low and "insertion" not in low:
+        return _c(_ANSI_RED, s)
+
+    return _c(_ANSI_YELLOW, s)
+
+
+def _print_git_pull_output(out: str) -> None:
+    """Blank/separator lines around colorized git pull output."""
+    sep = "-" * 56
+    print()
+    print(_c(_ANSI_CYAN, sep))
+    print()
+    text = (out or "").rstrip()
+    if not text:
+        print(_c(_ANSI_YELLOW, "(no output)"))
+    else:
+        for line in text.splitlines():
+            print(_colorize_git_pull_line(line))
+    print()
+    print(_c(_ANSI_CYAN, sep))
+    print()
 
 
 def _print_info_panel(title: str, lines: List[str]) -> None:
@@ -705,10 +764,13 @@ esac
     if not _pause("Press Enter to run…"):
         return
     try:
-        code, used_sudo = ssh_remote_sudo_fallback(server, remote_script, interactive=True)
+        code, out, used_sudo = ssh_remote_capture_sudo_fallback(
+            server, remote_script, timeout=180.0, always_retry=True
+        )
     except KeyboardInterrupt:
         print(f"\n{_CANCEL_HINT}")
         return
+    _print_git_pull_output(out)
     if used_sudo:
         print("  used: sudo -S")
     print(f"Exit: {code}")
