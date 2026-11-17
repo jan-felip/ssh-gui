@@ -512,9 +512,6 @@ def _init_colors() -> None:
     curses.init_pair(13, curses.COLOR_BLACK, curses.COLOR_CYAN)  # asterisk on selected row
     curses.init_pair(14, curses.COLOR_YELLOW, -1)  # [-] discard
     curses.init_pair(15, curses.COLOR_WHITE, curses.COLOR_YELLOW)  # discard focused
-    # Search box: white text on gray background
-    gray_bg = 8 if curses.COLORS >= 16 else curses.COLOR_BLACK
-    curses.init_pair(16, curses.COLOR_WHITE, gray_bg)
 
 
 # ⌕ U+2315 TELEPHONE RECORDER — classic single-cell magnifier in macOS Terminal
@@ -553,10 +550,13 @@ def _draw_search_box(
     Returns next free row.
     """
     box_w = max(8, term_w - 1)
-    border_attr = curses.color_pair(8)
+    # Same gray pair as ▄/▀ borders (pair 8). Reverse puts that gray on the
+    # background so the middle matches the border shade exactly.
+    gray = curses.color_pair(8)
     if curses.COLORS < 16:
-        border_attr |= curses.A_DIM
-    mid_attr = curses.color_pair(16) | curses.A_BOLD
+        gray |= curses.A_DIM
+    border_attr = gray
+    mid_attr = gray | curses.A_REVERSE | curses.A_BOLD
 
     _safe_add(stdscr, y, 0, "▄" * box_w, border_attr)
 
