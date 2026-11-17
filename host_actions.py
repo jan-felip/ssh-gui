@@ -362,23 +362,41 @@ def remote_is_git(server: core.Server) -> bool:
     return remote_detect_flags(server)[0]
 
 
+REMI_PHP_ENABLE = "/opt/remi/php81/enable"
+
+
 def action_drush(server: core.Server, title: str, drush_args: str) -> None:
-    """Run vendor/bin/drush <args> in web_remote (sudo fallback OK)."""
+    """Run vendor/bin/drush <args> in web_remote (sudo + Remi PHP retries)."""
     if not server.web_remote:
         return
     path = normalize_remote_path(server.web_remote)
     path_q = shlex.quote(path)
     cmd = f"cd {path_q} && vendor/bin/drush {drush_args}"
+    remi_cmd = (
+        f"cd {path_q} && source {shlex.quote(REMI_PHP_ENABLE)} && "
+        f"vendor/bin/drush {drush_args}"
+    )
     print(f"→ {title} on {server.label}")
     print(f"  path: {path}")
     print(f"  cmd:  vendor/bin/drush {drush_args}")
-    print("  (non-sudo first; sudo -S fallback if password in YAML)")
+    print("  (non-sudo first; sudo -S fallback; then Remi PHP enable retry)")
     _pause("Press Enter to run (Ctrl+C abort)…")
+    used_sudo = False
+    used_remi = False
     try:
         code, used_sudo = ssh_remote_sudo_fallback(server, cmd, interactive=True)
+        if code != 0:
+            print(f"  retrying after source {REMI_PHP_ENABLE} …")
+            code, used_sudo2 = ssh_remote_sudo_fallback(
+                server, remi_cmd, interactive=True
+            )
+            used_sudo = used_sudo or used_sudo2
+            used_remi = True
     except KeyboardInterrupt:
         print("\nCancelled.")
-        code, used_sudo = 130, False
+        code = 130
+    if used_remi:
+        print(f"  used: source {REMI_PHP_ENABLE}")
     if used_sudo:
         print("  used: sudo -S")
     print(f"Exit: {code}")
