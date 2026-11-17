@@ -16,6 +16,7 @@
 #   web_local   (optional) local project directory to rsync from
 #   git_user    (optional) username for private HTTPS git pull on remote
 #   git_token   (optional) token/password for git — NEVER commit real tokens
+#   remi_php    (optional) cached Remi version from Vendor Drush, e.g. php83
 
 example_lab:
   host: 192.0.2.10

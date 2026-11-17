@@ -10,6 +10,7 @@ import shlex
 import subprocess
 import sys
 import urllib.parse
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, List, Optional, Tuple
 
@@ -54,6 +55,8 @@ _ANSI_GREEN = "\033[1;32m"
 _ANSI_YELLOW = "\033[1;33m"
 _ANSI_CYAN = "\033[1;36m"
 _ANSI_CYAN_DIM = "\033[0;36m"
+_ANSI_SUCCESS_TAG = "\033[1;37;42m"  # bold white on green
+_ANSI_SUCCESS_REST = "\033[1;37;40m"  # bold white on black
 
 _GIT_FILE_STAT_RE = re.compile(r"\|\s*\d+\s+([+\-]+)\s*$")
 
@@ -483,13 +486,48 @@ def remote_is_git(server: core.Server) -> bool:
 REMI_PHP_ENABLE_CANDIDATES = tuple(
     f"/opt/remi/php{v}/enable" for v in ("81", "82", "83", "84")
 )
+_REMI_PHP_RE = re.compile(r"^php8[1-4]$")
+_REMI_USING_RE = re.compile(r"Using Remi:\s*source\s+(\S+)")
+_DRUSH_SUCCESS_RE = re.compile(r"\[success\]", re.IGNORECASE)
 
 
-def remi_drush_cmd(path_q: str, drush_args: str) -> str:
+def remi_php_label(enable_path: str) -> str:
+    """'/opt/remi/php83/enable' → 'php83'."""
+    name = Path(enable_path).parent.name
+    return name if _REMI_PHP_RE.match(name) else ""
+
+
+def remi_enable_for(remi_php: str) -> str:
+    return f"/opt/remi/{remi_php}/enable"
+
+
+def remi_drush_cmd(
+    path_q: str,
+    drush_args: str,
+    *,
+    preferred: Optional[str] = None,
+    quiet: bool = False,
+) -> str:
     """
-    Source the first existing Remi enable (php81→php84), then run drush.
-    Skips missing paths; fails clearly if none exist.
+    Source Remi enable then run drush.
+    preferred=php83 → that path only; else first existing php81→php84.
     """
+    announce = "" if quiet else 'echo "Using Remi: source $enable" >&2'
+    if preferred and _REMI_PHP_RE.match(preferred):
+        enable_q = shlex.quote(remi_enable_for(preferred))
+        return f"""
+set -e
+cd {path_q}
+enable={enable_q}
+if [ ! -f "$enable" ]; then
+  echo "Cached Remi enable missing: $enable" >&2
+  exit 127
+fi
+{announce}
+# shellcheck disable=SC1090
+source "$enable"
+vendor/bin/drush {drush_args}
+"""
     checks = " ".join(shlex.quote(p) for p in REMI_PHP_ENABLE_CANDIDATES)
     return f"""
 set -e
@@ -505,86 +543,237 @@ if [ -z "$enable" ]; then
   echo "No Remi PHP enable found (tried php81–php84 under /opt/remi/)." >&2
   exit 127
 fi
-echo "Using Remi: source $enable" >&2
+{announce}
 # shellcheck disable=SC1090
 source "$enable"
 vendor/bin/drush {drush_args}
 """
 
 
-def action_drush(server: core.Server, title: str, drush_args: str) -> None:
+def _print_red_block(lines: List[str]) -> None:
+    """Failed-attempt lines in red, then a blank line under the block."""
+    for line in lines:
+        text = line.rstrip("\n")
+        if text.strip():
+            print(_c(_ANSI_RED, text))
+    print()
+
+
+def _print_success_line(line: str) -> None:
+    """[success] white on green; rest of line white on black."""
+    text = line.rstrip("\n")
+    m = _DRUSH_SUCCESS_RE.search(text)
+    if not m:
+        print(_c(_ANSI_GREEN, text))
+        return
+    before = text[: m.start()]
+    tag = text[m.start() : m.end()]
+    after = text[m.end() :]
+    if not sys.stdout.isatty():
+        print(text)
+        return
+    print(
+        f"{before}{_ANSI_SUCCESS_TAG}{tag}{_ANSI_RST}"
+        f"{_ANSI_SUCCESS_REST}{after}{_ANSI_RST}"
+    )
+
+
+def _print_drush_output_line(line: str, *, quiet: bool = False) -> None:
+    text = line.rstrip("\n")
+    if not text.strip():
+        return
+    if _REMI_USING_RE.search(text):
+        if quiet:
+            return
+        print(_c(_ANSI_YELLOW, text))
+        return
+    if _DRUSH_SUCCESS_RE.search(text):
+        _print_success_line(text)
+        return
+    if quiet:
+        return
+    print(text)
+
+
+def _parse_remi_enable_used(out: str) -> str:
+    for line in (out or "").splitlines():
+        m = _REMI_USING_RE.search(line)
+        if m:
+            return m.group(1).strip()
+        for cand in REMI_PHP_ENABLE_CANDIDATES:
+            if cand in line and "Using Remi" in line:
+                return cand
+    return ""
+
+
+def _success_lines_from(out: str, title: str) -> List[str]:
+    found = [ln for ln in (out or "").splitlines() if _DRUSH_SUCCESS_RE.search(ln)]
+    if found:
+        return found
+    return [f"[success] {title} finished."]
+
+
+def _persist_remi_php(
+    config_path: Optional[Path],
+    server: core.Server,
+    remi_php: str,
+) -> core.Server:
+    if not remi_php or not config_path:
+        return server
+    if server.remi_php == remi_php:
+        return server
+    updated = replace(server, remi_php=remi_php)
+    try:
+        core.update_server(config_path, server.name, updated)
+    except Exception:  # noqa: BLE001
+        return server
+    return updated
+
+
+def action_drush(
+    server: core.Server,
+    title: str,
+    drush_args: str,
+    config_path: Optional[Path] = None,
+) -> core.Server:
     """Run vendor/bin/drush <args> in web_remote (sudo + Remi PHP retries)."""
     if not server.web_remote:
-        return
+        return server
     path = normalize_remote_path(server.web_remote)
     path_q = shlex.quote(path)
-    cmd = f"cd {path_q} && vendor/bin/drush {drush_args}"
-    remi_cmd = remi_drush_cmd(path_q, drush_args)
+    plain_cmd = f"cd {path_q} && vendor/bin/drush {drush_args}"
+    cached = server.remi_php if (server.remi_php and _REMI_PHP_RE.match(server.remi_php)) else None
+    quiet = bool(cached)
+
+    note = (
+        f"note:  Remi {cached} (cached) → sudo fallback"
+        if cached
+        else "note:  plain → sudo → Remi php81–84 enable (+ sudo)"
+    )
     _print_info_panel(
         title,
         [
             f"host:  {server.label}",
             f"path:  {path}",
             f"cmd:   vendor/bin/drush {drush_args}",
-            "note:  plain → sudo (if YAML pass) → Remi php81–84 enable (+ sudo)",
+            note,
             _RUN_KEYS_NOTE,
         ],
     )
     if not _pause("Press Enter to run…"):
-        return
+        return server
+    print()  # blank after first Press Enter
+
     used_sudo = False
     used_remi = False
     remi_enable_used = ""
     out = ""
+    code = 1
+
     try:
-        code, used_sudo = ssh_remote_sudo_fallback(server, cmd, interactive=True)
-        if code != 0:
-            print("  retrying with first existing Remi enable (php81–php84) …")
-            # Capture so we can show a pasteable RED error if this also fails.
-            code, out, used_sudo2 = ssh_remote_capture_sudo_fallback(
+        if cached:
+            remi_cmd = remi_drush_cmd(
+                path_q, drush_args, preferred=cached, quiet=True
+            )
+            code, out, used_sudo = ssh_remote_capture_sudo_fallback(
                 server, remi_cmd, timeout=180.0, always_retry=True
             )
-            used_sudo = used_sudo or used_sudo2
             used_remi = True
-            for cand in REMI_PHP_ENABLE_CANDIDATES:
-                if f"Using Remi: source {cand}" in (out or ""):
-                    remi_enable_used = cand
-                    break
-            if out.strip():
-                print(out.rstrip())
-                print()
+            remi_enable_used = remi_enable_for(cached)
+            if code != 0:
+                # Cached path failed — fall through to discovery (verbose).
+                quiet = False
+                _print_red_block(
+                    [
+                        f"Cached Remi {cached} failed (exit {code}).",
+                        "Retrying: plain → Remi php81–84 probe…",
+                    ]
+                )
+                code, out1, used_sudo1 = ssh_remote_capture_sudo_fallback(
+                    server, plain_cmd, timeout=180.0, always_retry=True
+                )
+                used_sudo = used_sudo or used_sudo1
+                if code != 0:
+                    fail_lines = [ln for ln in (out1 or "").splitlines() if ln.strip()]
+                    fail_lines.append(
+                        "retrying with first existing Remi enable (php81–php84) …"
+                    )
+                    _print_red_block(fail_lines)
+                    remi_cmd = remi_drush_cmd(path_q, drush_args, quiet=False)
+                    code, out, used_sudo2 = ssh_remote_capture_sudo_fallback(
+                        server, remi_cmd, timeout=180.0, always_retry=True
+                    )
+                    used_sudo = used_sudo or used_sudo2
+                    used_remi = True
+                    remi_enable_used = _parse_remi_enable_used(out) or remi_enable_used
+                else:
+                    out = out1
+                    used_remi = False
+                    remi_enable_used = ""
+        else:
+            code, out1, used_sudo = ssh_remote_capture_sudo_fallback(
+                server, plain_cmd, timeout=180.0, always_retry=True
+            )
+            if code != 0:
+                fail_lines = [ln for ln in (out1 or "").splitlines() if ln.strip()]
+                fail_lines.append(
+                    "retrying with first existing Remi enable (php81–php84) …"
+                )
+                _print_red_block(fail_lines)
+                remi_cmd = remi_drush_cmd(path_q, drush_args, quiet=False)
+                code, out, used_sudo2 = ssh_remote_capture_sudo_fallback(
+                    server, remi_cmd, timeout=180.0, always_retry=True
+                )
+                used_sudo = used_sudo or used_sudo2
+                used_remi = True
+                remi_enable_used = _parse_remi_enable_used(out)
+            else:
+                out = out1
     except KeyboardInterrupt:
         print(f"\n{_CANCEL_HINT}")
-        return
-    if used_remi:
-        if remi_enable_used:
-            print(f"  used: source {remi_enable_used}")
+        return server
+
+    if code == 0:
+        if quiet and used_remi:
+            for line in _success_lines_from(out, title):
+                _print_success_line(line)
         else:
-            print("  used: Remi php81–php84 probe (no enable reported)")
-    if used_sudo:
-        print("  used: sudo -S")
-    print(f"Exit: {code}")
-    if code != 0:
-        last_cmd = (
-            f"cd {path} && source <first of php81–84> && vendor/bin/drush {drush_args}"
-            if used_remi
-            else cmd
-        )
-        _print_error_panel(
-            f"{title} failed",
-            [
-                f"host: {server.label}",
-                f"path: {path}",
-                f"exit: {code}",
-                f"cmd:  {last_cmd}",
-                "Tried: plain → sudo (if YAML pass) → Remi php81–84 enable (+ sudo).",
-                "Copy the output below for debugging.",
-            ],
-            out,
-        )
-        _pause("Press Enter to return…")
-        return
-    _pause()
+            for line in (out or "").splitlines():
+                _print_drush_output_line(line, quiet=False)
+            # Ensure a styled success line exists
+            if not any(_DRUSH_SUCCESS_RE.search(ln) for ln in (out or "").splitlines()):
+                _print_success_line(f"[success] {title} finished.")
+        if used_remi and remi_enable_used:
+            label = remi_php_label(remi_enable_used)
+            if label:
+                server = _persist_remi_php(config_path, server, label)
+        print()  # blank before final Press Enter
+        _pause()
+        return server
+
+    # Failure
+    for line in (out or "").splitlines():
+        _print_drush_output_line(line, quiet=False)
+    last_cmd = (
+        f"cd {path} && source {remi_enable_used or '<remi>'} && vendor/bin/drush {drush_args}"
+        if used_remi
+        else plain_cmd
+    )
+    _print_error_panel(
+        f"{title} failed",
+        [
+            f"host: {server.label}",
+            f"path: {path}",
+            f"exit: {code}",
+            f"cmd:  {last_cmd}",
+            "Tried: plain → sudo → Remi php81–84 (+ sudo).",
+            "Copy the output below for debugging.",
+        ],
+        out,
+    )
+    print()
+    _pause("Press Enter to return…")
+    return server
 
 
 def pick_local_directory(
@@ -1116,35 +1305,48 @@ def host_actions_menu(
             elif action == "drush_cr":
                 _suspend_curses(stdscr)
                 try:
-                    action_drush(server, "Rebuild cache", "cr")
+                    server = action_drush(
+                        server, "Rebuild cache", "cr", config_path=config_path
+                    )
                 finally:
                     _resume_curses(stdscr)
                 status = "Rebuild cache finished."
             elif action == "drush_updb":
                 _suspend_curses(stdscr)
                 try:
-                    action_drush(server, "Update Database", "updatedb -y")
+                    server = action_drush(
+                        server,
+                        "Update Database",
+                        "updatedb -y",
+                        config_path=config_path,
+                    )
                 finally:
                     _resume_curses(stdscr)
                 status = "Update Database finished."
             elif action == "drush_uli":
                 _suspend_curses(stdscr)
                 try:
-                    action_drush(server, "Admin login", "uli")
+                    server = action_drush(
+                        server, "Admin login", "uli", config_path=config_path
+                    )
                 finally:
                     _resume_curses(stdscr)
                 status = "Admin login finished."
             elif action == "drush_cim":
                 _suspend_curses(stdscr)
                 try:
-                    action_drush(server, "Config: Import", "cim")
+                    server = action_drush(
+                        server, "Config: Import", "cim", config_path=config_path
+                    )
                 finally:
                     _resume_curses(stdscr)
                 status = "Config import finished."
             elif action == "drush_cex":
                 _suspend_curses(stdscr)
                 try:
-                    action_drush(server, "Config: Export", "cex")
+                    server = action_drush(
+                        server, "Config: Export", "cex", config_path=config_path
+                    )
                 finally:
                     _resume_curses(stdscr)
                 status = "Config export finished."

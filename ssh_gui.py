@@ -86,6 +86,7 @@ class Server:
     web_local: Optional[str] = None
     git_user: Optional[str] = None
     git_token: Optional[str] = None
+    remi_php: Optional[str] = None  # e.g. php83 — cached Remi enable from Vendor Drush
 
     @property
     def label(self) -> str:
@@ -112,6 +113,8 @@ class Server:
             data["git_user"] = self.git_user
         if self.git_token:
             data["git_token"] = self.git_token
+        if self.remi_php:
+            data["remi_php"] = self.remi_php
         return data
 
 
@@ -159,6 +162,7 @@ def parse_servers(raw: Dict[str, Any]) -> List[Server]:
                 web_local=expand_path(str(data["web_local"])) if data.get("web_local") else None,
                 git_user=(str(data["git_user"]) if data.get("git_user") else None),
                 git_token=(str(data["git_token"]) if data.get("git_token") else None),
+                remi_php=(str(data["remi_php"]) if data.get("remi_php") else None),
             )
         )
     return servers
@@ -693,6 +697,8 @@ def _commit_field_buf(values: Dict[str, str], key: str, buf: List[str]) -> None:
 def _build_server_from_values(
     values: Dict[str, str],
     blocked_names: set,
+    *,
+    remi_php: Optional[str] = None,
 ) -> Tuple[Optional[Server], Optional[str]]:
     """Validate form values → (Server, None) or (None, error)."""
     name = values["name"].strip()
@@ -735,6 +741,7 @@ def _build_server_from_values(
             web_local=expand_path(web_local) if web_local else None,
             git_user=git_user or None,
             git_token=git_token or None,
+            remi_php=remi_php or None,
         ),
         None,
     )
@@ -983,7 +990,11 @@ def host_form(
                                 focus_row(i)
                                 break
                         continue
-                    server, err = _build_server_from_values(values, blocked_names)
+                    server, err = _build_server_from_values(
+                        values,
+                        blocked_names,
+                        remi_php=(initial.remi_php if initial else None),
+                    )
                     if err or server is None:
                         error = err or "Could not save."
                         continue
