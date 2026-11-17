@@ -563,8 +563,8 @@ def _draw_search_box(
 ) -> int:
     """
     Cursor-CLI-style soft charcoal input strip (no ▄/▀ brick borders):
-    side margins, muted fill slightly above terminal black, magnifier + text.
-    Returns next free row.
+    side margins; empty charcoal row, text row, empty charcoal row.
+    Returns next free row (table header follows).
     """
     margin = 2
     box_w = max(8, term_w - 1 - margin * 2)
@@ -573,8 +573,13 @@ def _draw_search_box(
     mute_attr = curses.color_pair(17)  # muted on charcoal
     if curses.COLORS < 16:
         mute_attr |= curses.A_DIM
+    fill = " " * box_w
 
-    # Soft vertical breathing room (layering), then one filled strip
+    # Top empty charcoal row (same margins / fill)
+    _safe_add(stdscr, y, x0, fill, mute_attr)
+
+    # Middle text row
+    text_y = y + 1
     prefix = f" {SEARCH_GLYPH} "
     placeholder = "Search hosts…"
     if query:
@@ -583,14 +588,23 @@ def _draw_search_box(
         # Magnifier muted, typed query white — same charcoal bg
         glyph_part = prefix
         rest = shown + (" " * max(0, box_w - len(prefix) - len(shown)))
-        _safe_add(stdscr, y, x0, glyph_part[:box_w], mute_attr)
-        _safe_add(stdscr, y, x0 + len(glyph_part), rest[: max(0, box_w - len(glyph_part))], text_attr)
+        _safe_add(stdscr, text_y, x0, glyph_part[:box_w], mute_attr)
+        _safe_add(
+            stdscr,
+            text_y,
+            x0 + len(glyph_part),
+            rest[: max(0, box_w - len(glyph_part))],
+            text_attr,
+        )
     else:
         body = prefix + placeholder
         pad = max(0, box_w - len(body))
-        _safe_add(stdscr, y, x0, (body + (" " * pad))[:box_w], mute_attr)
+        _safe_add(stdscr, text_y, x0, (body + (" " * pad))[:box_w], mute_attr)
 
-    return y + 2  # strip + blank spacer before table header
+    # Bottom empty charcoal row
+    _safe_add(stdscr, y + 2, x0, fill, mute_attr)
+
+    return y + 3  # three charcoal rows; header starts next
 
 
 def _fit_cell(text: str, width: int) -> str:
