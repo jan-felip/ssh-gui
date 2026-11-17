@@ -36,6 +36,18 @@ def _pause(msg: str = "Press Enter to continue…") -> None:
         pass
 
 
+def _confirm_yn(prompt: str, *, default_yes: bool = False) -> bool:
+    """Ask (y/N) or (Y/n). Empty input uses default. Default for rsync is N."""
+    suffix = " [Y/n]: " if default_yes else " [y/N]: "
+    try:
+        ans = input(prompt + suffix).strip().lower()
+    except EOFError:
+        return default_yes
+    if not ans:
+        return default_yes
+    return ans in ("y", "yes")
+
+
 def _ssh_target(server: core.Server) -> str:
     return f"{server.user}@{server.host}"
 
@@ -479,7 +491,10 @@ def action_rsync_upload(server: core.Server) -> None:
     print(f"  remote: {dest}")
     print(f"  cmd:    {' '.join(shlex.quote(a) for a in argv)}")
     print(f"  after:  chmod dirs {PERM_PRESET_DIRS} / files {PERM_PRESET_FILES}")
-    _pause("Press Enter to run rsync+chmod (Ctrl+C abort)…")
+    if not _confirm_yn("Run upload rsync+chmod?", default_yes=False):
+        print("Cancelled.")
+        _pause()
+        return
     try:
         code = run_argv(argv, server, interactive=True)
     except KeyboardInterrupt:
@@ -600,7 +615,10 @@ def action_rsync_download(server: core.Server) -> None:
     print(f"  remote: {src}")
     print(f"  local:  {dest}")
     print(f"  cmd:    {' '.join(shlex.quote(a) for a in argv)}")
-    _pause("Press Enter to run rsync (Ctrl+C abort)…")
+    if not _confirm_yn("Run download rsync?", default_yes=False):
+        print("Cancelled.")
+        _pause()
+        return
     try:
         code = run_argv(argv, server, interactive=True)
     except KeyboardInterrupt:
