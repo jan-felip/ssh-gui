@@ -1,125 +1,202 @@
 # ssh-gui
 
-Terminal TUI to quickly SSH into hosts defined in a local YAML inventory, plus a host **actions** menu for deploy helpers (rsync, git pull, permissions).
+[![Last commit](https://img.shields.io/github/last-commit/jan-felip/ssh-gui)](https://github.com/jan-felip/ssh-gui/commits/main)
+[![License: GPL-3.0](https://img.shields.io/github/license/jan-felip/ssh-gui)](https://github.com/jan-felip/ssh-gui/blob/main/LICENSE)
+[![Python](https://img.shields.io/badge/python-3.x-blue.svg)](https://www.python.org/)
+[![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey.svg)](https://github.com/jan-felip/ssh-gui)
 
-## Requirements
+> **A convenient solution to a problem that nobody has.**  
+> *Una solució convenient a un problema que ningú no té.*
 
-- macOS with Python 3 (system Python is fine)
-- `ssh` / `rsync` (OpenSSH)
-- Preferred: SSH keys via `identity` instead of `pass`
-- YAML passwords are auto-typed at the SSH prompt (stdlib PTY; no sshpass required)
+Menú TUI al terminal per connectar per SSH a hosts d’un inventari YAML local, amb accions de deploy (rsync, git, Drush…).  
+Terminal TUI to SSH into hosts from a local YAML inventory, plus deploy helpers (rsync, git, Drush…).
 
-## Quick install
+**Author:** [jan-felip](https://github.com/jan-felip)
+
+---
+
+## Català
+
+### Què és
+
+`ssh-gui` obre un menú amb la llista de servidors que hagis desat localment. `Enter` connecta per SSH; `e` edita la config; `→` obre accions (git, rsync, Vendor/Drush). Les contrasenyes del YAML s’escriuen soles a la terminal al entrar.
+
+### Requisits
+
+- Linux o macOS amb Python 3
+- `ssh` i `rsync` (OpenSSH)
+- Preferible clau SSH (`identity`) en lloc de `pass` *(també funciona si la tens desada a la configuració d'ssh a l'ordinador, no cal especificar-la aquí)*
+
+### Instal·lació
 
 ```bash
+git clone https://github.com/jan-felip/ssh-gui.git ~/ssh-gui
 cd ~/ssh-gui
 ./install.sh
 ```
 
-This creates the venv, installs PyYAML, and symlinks `~/.local/bin/ssh-gui`.
+Crea el venv, instal·la PyYAML i enllaça `~/.local/bin/ssh-gui`.
 
-If `ssh-gui` is not found:
+Si no trobes la comanda:
 
 ```bash
-echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc
+echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc   # o ~/.bashrc
 source ~/.zshrc
 ```
 
-## Configuration
-
-```yaml
-my_server_name:
-  host: 10.0.0.5
-  user: jan
-  pass: "optional"
-  port: 22
-  identity: ~/.ssh/id_ed25519
-  notes: "short menu label"
-  web_remote: /var/www/app          # remote path for rsync / git
-  web_local: ~/Projects/my-app      # local folder to upload
-  git_user: jan                     # optional HTTPS git auth on remote
-  git_token: "never-commit-this"
-```
-
-**Important:** `servers.yaml` is gitignored. Never push real passwords or `git_token` values. Only commit `servers.example.yaml`.
-
-## Usage
+### Inventari YAML
 
 ```bash
-ssh-gui              # TUI
-ssh-gui --list
-ssh-gui --dry-run
-ssh-gui --connect NAME
+cp servers.example.yaml servers.yaml
+chmod 600 servers.yaml
 ```
 
-### Main list
+Exemple (placeholders):
+
+```yaml
+my_server:
+  host: 192.0.2.10
+  user: deploy
+  # pass: "optional"          # millor identity
+  identity: ~/.ssh/id_ed25519
+  notes: "etiqueta al menú"
+  web_remote: /var/www/app
+  web_local: ~/Projects/my-app
+  # git_user / git_token      # només si cal pull HTTPS al remot
+```
+
+`servers.yaml` està al `.gitignore`. Només es pot publicar `servers.example.yaml`.
+
+### Ús
+
+```bash
+ssh-gui                 # TUI
+ssh-gui --list
+ssh-gui --connect NAME
+ssh-gui --dry-run
+```
+
+#### Llista principal
+
+| Tecla | Acció |
+|-------|--------|
+| Escriure | Obre el cercador (filtra nom / host / notes) |
+| Esc | Tanca/neteja el cercador (no surt de l’app) |
+| ↑↓ / j k | Moure |
+| Enter | Connectar SSH (o `[+] Add host`) |
+| e | **Edit** (config durable: SSH + `web_*` + `git_*`) |
+| → | Accions runtime (deploy / git / Vendor) |
+| Ctrl+C | Sortir |
+
+#### Accions (`→`)
+
+Només runtime. Si falta config, surten deshabilitades amb pista d’usar Edit.
+
+- **Git:** pull, historial  
+- **Deploy:** rsync upload (+ chmod 755/644), download, fix permissions  
+- **Vendor** (si existeix `web_remote/vendor`): Drush `cr`, `updatedb -y`, `uli`, `cim`, `cex` (fallback Remi PHP + sudo) *(Això existeix ja que habituo a treballar amb webs basades en Drupal)*
+
+Enter a un host amb `web_remote` obre l’SSH ja dins aquell directori.
+
+### Seguretat
+
+- `chmod 600 servers.yaml`
+- Preferir claus a contrasenyes / tokens en text pla
+- No commitjar mai `servers.yaml` ni `git_token` reals
+
+---
+
+## English
+
+### What it is
+
+`ssh-gui` opens a menu with the list of servers you have saved locally. `Enter` connects over SSH; `e` edits the config; `→` opens actions (git, rsync, Vendor/Drush). Passwords from the YAML are typed into the terminal automatically on login.
+
+### Requirements
+
+- Linux or macOS with Python 3
+- `ssh` and `rsync` (OpenSSH)
+- Prefer an SSH key (`identity`) over `pass` *(also works if the key is already in your machine’s SSH config — you don’t need to set it here)*
+
+### Install
+
+```bash
+git clone https://github.com/jan-felip/ssh-gui.git ~/ssh-gui
+cd ~/ssh-gui
+./install.sh
+```
+
+Creates the venv, installs PyYAML, and symlinks `~/.local/bin/ssh-gui`.
+
+If you can’t find the command:
+
+```bash
+echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc   # or ~/.bashrc
+source ~/.zshrc
+```
+
+### YAML inventory
+
+```bash
+cp servers.example.yaml servers.yaml
+chmod 600 servers.yaml
+```
+
+Example (placeholders):
+
+```yaml
+my_server:
+  host: 192.0.2.10
+  user: deploy
+  # pass: "optional"          # prefer identity
+  identity: ~/.ssh/id_ed25519
+  notes: "menu label"
+  web_remote: /var/www/app
+  web_local: ~/Projects/my-app
+  # git_user / git_token      # only if remote HTTPS pull is needed
+```
+
+`servers.yaml` is in `.gitignore`. Only `servers.example.yaml` may be published.
+
+### Usage
+
+```bash
+ssh-gui                 # TUI
+ssh-gui --list
+ssh-gui --connect NAME
+ssh-gui --dry-run
+```
+
+#### Main list
 
 | Key | Action |
 |-----|--------|
-| ↑↓ | Move |
-| Enter | SSH connect (or open Add host) |
-| e | **Edit** durable config (SSH + `web_*` + `git_*`) |
-| → | Host **runtime actions** (deploy helpers) |
-| q | Quit |
+| Type | Opens search (filters name / host / notes) |
+| Esc | Closes/clears search (does not quit the app) |
+| ↑↓ / j k | Move |
+| Enter | Connect SSH (or `[+] Add host`) |
+| e | **Edit** (durable config: SSH + `web_*` + `git_*`) |
+| → | Runtime actions (deploy / git / Vendor) |
+| Ctrl+C | Quit |
 
-### Edit / Add (`e`)
+#### Actions (`→`)
 
-Owns all saved fields: host/user/pass/identity/notes, plus `web_remote`, `web_local` (Enter on **Web local** opens a folder browser), `git_user`, `git_token`.
+Runtime only. If config is missing, items show disabled with a hint to use Edit.
 
-### Host actions (`→`)
+- **Git:** pull, history  
+- **Deploy:** rsync upload (+ chmod 755/644), download, fix permissions  
+- **Vendor** (if `web_remote/vendor` exists): Drush `cr`, `updatedb -y`, `uli`, `cim`, `cex` (Remi PHP + sudo fallback) *(This exists because I usually work on Drupal-based sites)*
 
-Runtime only — no path settings here. Missing config shows as disabled with a hint to use Edit.
+Enter on a host with `web_remote` opens SSH already inside that directory.
 
-| Action | When enabled |
-|--------|----------------|
-| Git pull | `web_remote` is a git work tree |
-| Commit history | same (`git log` short on remote) |
-| Upload (rsync) + fix permissions | both `web_local` and `web_remote` set |
-| Download (rsync) | same — remote → local (simple rsync progress like upload) |
-| Fix permissions only | `web_remote` set |
-| ← / q | Back to host list |
+### Security
 
+- `chmod 600 servers.yaml`
+- Prefer keys over plaintext passwords / tokens
+- Never commit `servers.yaml` or real `git_token` values
 
-Each enabled run prints the command and waits for Enter before executing.
+---
 
-**Permission preset:** after a successful upload rsync (and via “Fix permissions only”):
+## License
 
-```bash
-find <web_remote> -type d -exec chmod 755 {} +
-find <web_remote> -type f -exec chmod 644 {} +
-```
-
-## Auth
-
-| Situation | Behaviour |
-|-----------|-----------|
-| `identity` set | `ssh -i …` |
-| `pass` without identity | Password auto-typed at the prompt (PTY) |
-| Neither | Interactive SSH auth |
-
-## Security
-
-- Keep `servers.yaml` mode `600`.
-- Prefer keys over plaintext passwords / tokens.
-- Never commit `servers.yaml` or real `git_token` values.
-
-## Layout
-
-```
-~/ssh-gui/
-  ssh_gui.py
-  host_actions.py         # → submenu (rsync / git / paths)
-  bin/ssh-gui
-  servers.example.yaml
-  servers.yaml            # LOCAL (gitignored)
-  …
-```
-
-## Try it
-
-```bash
-ssh-gui
-# highlight a host → press →
-# set web remote + local dir, then Upload or Git pull
-# Enter on the host still opens a normal SSH session
-```
+[GPL-3.0](LICENSE) · [jan-felip](https://github.com/jan-felip)
