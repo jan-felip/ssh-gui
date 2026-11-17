@@ -761,6 +761,7 @@ def host_actions_menu(
         if has_vendor:
             vendor_actions = [
                 ("drush_cr", "Rebuild cache", True),
+                ("drush_updb", "Update Database", True),
                 ("drush_uli", "Admin login", True),
                 ("drush_cim", "Config: Import", True),
                 ("drush_cex", "Config: Export", True),
@@ -905,6 +906,13 @@ def host_actions_menu(
                 finally:
                     _resume_curses(stdscr)
                 status = "Rebuild cache finished."
+            elif action == "drush_updb":
+                _suspend_curses(stdscr)
+                try:
+                    action_drush(server, "Update Database", "updatedb -y")
+                finally:
+                    _resume_curses(stdscr)
+                status = "Update Database finished."
             elif action == "drush_uli":
                 _suspend_curses(stdscr)
                 try:
