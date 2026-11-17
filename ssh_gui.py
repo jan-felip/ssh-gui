@@ -1244,14 +1244,13 @@ def menu_loop(config_path: Path, dry_run: bool = False) -> Tuple[str, Optional[S
             key = stdscr.getch()
             n = len(items) if items else 1
 
-            # Esc: close/clear search if open, else quit
+            # Esc: clear/close search only — never quit the main list
             if key == 27:
                 if search_open:
                     search_open = False
                     search_query = ""
                     idx = 0
-                    continue
-                return ("quit", None)
+                continue
 
             # Search box input
             if search_open and key in (curses.KEY_BACKSPACE, 127, 8):
@@ -1264,8 +1263,8 @@ def menu_loop(config_path: Path, dry_run: bool = False) -> Tuple[str, Optional[S
                     search_query += ch
                     idx = 0
                     continue
-                # Closed: keep e/j/k/q as shortcuts; any other printable opens search
-                if ch.lower() not in ("e", "j", "k", "q"):
+                # Closed: keep e/j/k as shortcuts; other printable (incl. q) opens search
+                if ch.lower() not in ("e", "j", "k"):
                     search_open = True
                     search_query = ch
                     idx = 0
@@ -1364,8 +1363,7 @@ def menu_loop(config_path: Path, dry_run: bool = False) -> Tuple[str, Optional[S
                         idx = i
                         break
                 continue
-            elif key in (ord("q"), ord("Q")):
-                return ("quit", None)
+            # Quit is Ctrl+C only (caught at top level after curses cleanup).
 
     return curses.wrapper(_run)
 
@@ -1506,12 +1504,17 @@ def main(argv: Optional[List[str]] = None) -> int:
         )
         return 1
 
-    action, chosen = menu_loop(args.config, dry_run=args.dry_run)
+    try:
+        action, chosen = menu_loop(args.config, dry_run=args.dry_run)
+    except KeyboardInterrupt:
+        return 0
     if action == "quit" or chosen is None:
-        print("Cancelled.")
         return 0
     return connect(chosen, dry_run=args.dry_run)
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        raise SystemExit(main())
+    except KeyboardInterrupt:
+        raise SystemExit(0) from None
