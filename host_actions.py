@@ -480,7 +480,36 @@ def remote_is_git(server: core.Server) -> bool:
     return remote_detect_flags(server)[0]
 
 
-REMI_PHP_ENABLE = "/opt/remi/php81/enable"
+REMI_PHP_ENABLE_CANDIDATES = tuple(
+    f"/opt/remi/php{v}/enable" for v in ("81", "82", "83", "84")
+)
+
+
+def remi_drush_cmd(path_q: str, drush_args: str) -> str:
+    """
+    Source the first existing Remi enable (php81→php84), then run drush.
+    Skips missing paths; fails clearly if none exist.
+    """
+    checks = " ".join(shlex.quote(p) for p in REMI_PHP_ENABLE_CANDIDATES)
+    return f"""
+set -e
+cd {path_q}
+enable=
+for f in {checks}; do
+  if [ -f "$f" ]; then
+    enable=$f
+    break
+  fi
+done
+if [ -z "$enable" ]; then
+  echo "No Remi PHP enable found (tried php81–php84 under /opt/remi/)." >&2
+  exit 127
+fi
+echo "Using Remi: source $enable" >&2
+# shellcheck disable=SC1090
+source "$enable"
+vendor/bin/drush {drush_args}
+"""
 
 
 def action_drush(server: core.Server, title: str, drush_args: str) -> None:
@@ -490,17 +519,14 @@ def action_drush(server: core.Server, title: str, drush_args: str) -> None:
     path = normalize_remote_path(server.web_remote)
     path_q = shlex.quote(path)
     cmd = f"cd {path_q} && vendor/bin/drush {drush_args}"
-    remi_cmd = (
-        f"cd {path_q} && source {shlex.quote(REMI_PHP_ENABLE)} && "
-        f"vendor/bin/drush {drush_args}"
-    )
+    remi_cmd = remi_drush_cmd(path_q, drush_args)
     _print_info_panel(
         title,
         [
             f"host:  {server.label}",
             f"path:  {path}",
             f"cmd:   vendor/bin/drush {drush_args}",
-            "note:  plain → sudo (if YAML pass) → Remi php81 enable (+ sudo)",
+            "note:  plain → sudo (if YAML pass) → Remi php81–84 enable (+ sudo)",
             _RUN_KEYS_NOTE,
         ],
     )
@@ -508,17 +534,22 @@ def action_drush(server: core.Server, title: str, drush_args: str) -> None:
         return
     used_sudo = False
     used_remi = False
+    remi_enable_used = ""
     out = ""
     try:
         code, used_sudo = ssh_remote_sudo_fallback(server, cmd, interactive=True)
         if code != 0:
-            print(f"  retrying after source {REMI_PHP_ENABLE} …")
+            print("  retrying with first existing Remi enable (php81–php84) …")
             # Capture so we can show a pasteable RED error if this also fails.
             code, out, used_sudo2 = ssh_remote_capture_sudo_fallback(
                 server, remi_cmd, timeout=180.0, always_retry=True
             )
             used_sudo = used_sudo or used_sudo2
             used_remi = True
+            for cand in REMI_PHP_ENABLE_CANDIDATES:
+                if f"Using Remi: source {cand}" in (out or ""):
+                    remi_enable_used = cand
+                    break
             if out.strip():
                 print(out.rstrip())
                 print()
@@ -526,12 +557,19 @@ def action_drush(server: core.Server, title: str, drush_args: str) -> None:
         print(f"\n{_CANCEL_HINT}")
         return
     if used_remi:
-        print(f"  used: source {REMI_PHP_ENABLE}")
+        if remi_enable_used:
+            print(f"  used: source {remi_enable_used}")
+        else:
+            print("  used: Remi php81–php84 probe (no enable reported)")
     if used_sudo:
         print("  used: sudo -S")
     print(f"Exit: {code}")
     if code != 0:
-        last_cmd = remi_cmd if used_remi else cmd
+        last_cmd = (
+            f"cd {path} && source <first of php81–84> && vendor/bin/drush {drush_args}"
+            if used_remi
+            else cmd
+        )
         _print_error_panel(
             f"{title} failed",
             [
@@ -539,7 +577,7 @@ def action_drush(server: core.Server, title: str, drush_args: str) -> None:
                 f"path: {path}",
                 f"exit: {code}",
                 f"cmd:  {last_cmd}",
-                "Tried: plain → sudo (if YAML pass) → Remi php81 enable (+ sudo).",
+                "Tried: plain → sudo (if YAML pass) → Remi php81–84 enable (+ sudo).",
                 "Copy the output below for debugging.",
             ],
             out,
