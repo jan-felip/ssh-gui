@@ -502,22 +502,28 @@ def _init_colors() -> None:
     curses.init_pair(5, curses.COLOR_GREEN, curses.COLOR_CYAN)  # [+] on cyan
     curses.init_pair(6, curses.COLOR_WHITE, curses.COLOR_CYAN)  # text on cyan
     curses.init_pair(7, curses.COLOR_RED, -1)  # errors / red mark / [-]
-    # Gray subtitle / search borders: prefer color 8 (bright black) when available
+    # Gray subtitle: prefer color 8 (bright black) when available
     gray = 8 if curses.COLORS >= 16 else curses.COLOR_WHITE
-    curses.init_pair(8, gray, -1)  # gray fg on default (subtitle, ▄/▀ borders)
-    # Search middle: white fg on *light* gray bg (not dark color-8 charcoal).
-    # Prefer 256-color light gray; else COLOR_WHITE bg (light in Terminal.app).
+    curses.init_pair(8, gray, -1)  # gray fg on default (subtitle)
+    # Search strip — Cursor CLI “elevated” charcoal on near-black (not bright 252).
+    # agent-cli tokens: --bg #0a0a0a, --bg-elevated #111111 / surfaces ~#1c1c1c–#303030.
     if curses.COLORS >= 256:
-        light_gray = 252  # xterm gray ramp — medium-light
+        charcoal = 236  # xterm #303030 — soft raised panel
+        placeholder_fg = 247  # muted light gray on charcoal
     elif curses.can_change_color():
-        light_gray = 20  # unused slot; define a light gray
+        charcoal = 20
+        placeholder_fg = 21
         try:
-            curses.init_color(light_gray, 700, 700, 700)  # 0–1000 RGB
+            curses.init_color(charcoal, 120, 120, 120)  # ~#1f1f1f
+            curses.init_color(placeholder_fg, 620, 620, 620)
         except curses.error:
-            light_gray = curses.COLOR_WHITE
+            charcoal = gray
+            placeholder_fg = curses.COLOR_WHITE
     else:
-        light_gray = curses.COLOR_WHITE
-    curses.init_pair(16, curses.COLOR_WHITE, light_gray)
+        charcoal = gray  # bright-black best 16-color approx
+        placeholder_fg = curses.COLOR_WHITE
+    curses.init_pair(16, curses.COLOR_WHITE, charcoal)  # typed text on charcoal
+    curses.init_pair(17, placeholder_fg, charcoal)  # magnifier / placeholder
     curses.init_pair(9, curses.COLOR_WHITE, curses.COLOR_RED)  # remove focused
     curses.init_pair(10, curses.COLOR_RED, curses.COLOR_RED)  # [-] on red bg
     curses.init_pair(11, curses.COLOR_WHITE, curses.COLOR_GREEN)  # save focused
@@ -556,31 +562,35 @@ def _draw_search_box(
     query: str,
 ) -> int:
     """
-    Full-width adaptive search box:
-      ▄▄▄…  (gray top)
-      ⌕ query… on gray bg / white text
-      ▀▀▀…  (gray bottom)
+    Cursor-CLI-style soft charcoal input strip (no ▄/▀ brick borders):
+    side margins, muted fill slightly above terminal black, magnifier + text.
     Returns next free row.
     """
-    box_w = max(8, term_w - 1)
-    # Borders: gray fg on default bg (pair 8) — not gray-on-gray
-    border_attr = curses.color_pair(8)
+    margin = 2
+    box_w = max(8, term_w - 1 - margin * 2)
+    x0 = margin
+    text_attr = curses.color_pair(16)  # white on charcoal
+    mute_attr = curses.color_pair(17)  # muted on charcoal
     if curses.COLORS < 16:
-        border_attr |= curses.A_DIM
-    mid_attr = curses.color_pair(16)  # white on gray; no bold / no reverse
+        mute_attr |= curses.A_DIM
 
-    _safe_add(stdscr, y, 0, "▄" * box_w, border_attr)
-
-    # glyph + space + query; pad to full width on gray
+    # Soft vertical breathing room (layering), then one filled strip
     prefix = f" {SEARCH_GLYPH} "
-    avail = max(0, box_w - len(prefix))
-    shown = query[-avail:] if len(query) > avail else query
-    pad = max(0, box_w - len(prefix) - len(shown))
-    middle = prefix + shown + (" " * pad)
-    _safe_add(stdscr, y + 1, 0, middle[:box_w], mid_attr)
+    placeholder = "Search hosts…"
+    if query:
+        avail = max(0, box_w - len(prefix))
+        shown = query[-avail:] if len(query) > avail else query
+        # Magnifier muted, typed query white — same charcoal bg
+        glyph_part = prefix
+        rest = shown + (" " * max(0, box_w - len(prefix) - len(shown)))
+        _safe_add(stdscr, y, x0, glyph_part[:box_w], mute_attr)
+        _safe_add(stdscr, y, x0 + len(glyph_part), rest[: max(0, box_w - len(glyph_part))], text_attr)
+    else:
+        body = prefix + placeholder
+        pad = max(0, box_w - len(body))
+        _safe_add(stdscr, y, x0, (body + (" " * pad))[:box_w], mute_attr)
 
-    _safe_add(stdscr, y + 2, 0, "▀" * box_w, border_attr)
-    return y + 3
+    return y + 2  # strip + blank spacer before table header
 
 
 def _fit_cell(text: str, width: int) -> str:
