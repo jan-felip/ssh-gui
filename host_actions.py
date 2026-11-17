@@ -1000,17 +1000,28 @@ esac
     _pause()
 
 
+def _colorize_git_log_line(line: str) -> str:
+    """Light colorization: yellow hash, rest default (else whole line yellow)."""
+    s = line.rstrip("\n")
+    m = re.match(r"^([0-9a-f]{7,40})(\s.*)?$", s, re.IGNORECASE)
+    if m:
+        rest = m.group(2) or ""
+        return _c(_ANSI_YELLOW, m.group(1)) + rest
+    return _c(_ANSI_YELLOW, s)
+
+
 def action_commit_history(server: core.Server, limit: int = 20) -> None:
     if not server.web_remote:
         return
-    path_q = shlex.quote(normalize_remote_path(server.web_remote))
+    path = normalize_remote_path(server.web_remote)
+    path_q = shlex.quote(path)
     fmt = shlex.quote("%h %ad %an %s")
     cmd = f"git -C {path_q} log -n {int(limit)} --date=short --pretty=format:{fmt}"
     _print_info_panel(
         "Git history",
         [
             f"host:  {server.label}",
-            f"path:  {normalize_remote_path(server.web_remote)}",
+            f"path:  {path}",
             f"cmd:   git log -n {limit} --pretty=…",
             "note:  non-sudo first; sudo -S fallback if password in YAML",
             _RUN_KEYS_NOTE,
@@ -1018,14 +1029,33 @@ def action_commit_history(server: core.Server, limit: int = 20) -> None:
     )
     if not _pause("Press Enter to run…"):
         return
+    print()  # blank after top Enter
     try:
-        code, used_sudo = ssh_remote_sudo_fallback(server, cmd, interactive=True)
+        code, out, used_sudo = ssh_remote_capture_sudo_fallback(
+            server, cmd, timeout=60.0, always_retry=True
+        )
     except KeyboardInterrupt:
         print(f"\n{_CANCEL_HINT}")
         return
-    if used_sudo:
-        print("  used: sudo -S")
-    print(f"\nExit: {code}")
+    text = (out or "").rstrip()
+    if text:
+        for line in text.splitlines():
+            print(_colorize_git_log_line(line))
+    elif code == 0:
+        print(_c(_ANSI_YELLOW, "(no commits)"))
+    if code != 0:
+        _print_error_panel(
+            "Git history failed",
+            [
+                f"host: {server.label}",
+                f"path: {path}",
+                f"exit: {code}",
+            ],
+            out,
+        )
+    elif used_sudo:
+        print(_c(_ANSI_CYAN_DIM, "  used: sudo -S"))
+    print()  # blank before bottom Enter
     _pause()
 
 
