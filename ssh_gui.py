@@ -505,8 +505,19 @@ def _init_colors() -> None:
     # Gray subtitle / search borders: prefer color 8 (bright black) when available
     gray = 8 if curses.COLORS >= 16 else curses.COLOR_WHITE
     curses.init_pair(8, gray, -1)  # gray fg on default (subtitle, ▄/▀ borders)
-    # Search middle: white fg on gray bg (same gray index)
-    curses.init_pair(16, curses.COLOR_WHITE, gray)
+    # Search middle: white fg on *light* gray bg (not dark color-8 charcoal).
+    # Prefer 256-color light gray; else COLOR_WHITE bg (light in Terminal.app).
+    if curses.COLORS >= 256:
+        light_gray = 252  # xterm gray ramp — medium-light
+    elif curses.can_change_color():
+        light_gray = 20  # unused slot; define a light gray
+        try:
+            curses.init_color(light_gray, 700, 700, 700)  # 0–1000 RGB
+        except curses.error:
+            light_gray = curses.COLOR_WHITE
+    else:
+        light_gray = curses.COLOR_WHITE
+    curses.init_pair(16, curses.COLOR_WHITE, light_gray)
     curses.init_pair(9, curses.COLOR_WHITE, curses.COLOR_RED)  # remove focused
     curses.init_pair(10, curses.COLOR_RED, curses.COLOR_RED)  # [-] on red bg
     curses.init_pair(11, curses.COLOR_WHITE, curses.COLOR_GREEN)  # save focused
