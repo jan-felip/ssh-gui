@@ -4,23 +4,14 @@
 from __future__ import annotations
 
 import curses
-import errno
 import os
-import pty
-import re
-import select
 import shlex
-import signal
 import subprocess
-import time
 import urllib.parse
 from pathlib import Path
-from typing import Any, Callable, List, Optional, Set, Tuple
+from typing import Any, List, Optional, Tuple
 
 import ssh_gui as core
-
-# rsync -i codes are 11 chars (e.g. >f+++++++++  cd+++++++++) then the path
-_RSYNC_ITEMIZE_RE = re.compile(r"^[^\s]{11}\s+(?P<name>.+)$")
 
 # Preset permission mode applied after upload (and available alone)
 PERM_PRESET_DIRS = "755"
@@ -576,557 +567,48 @@ def action_commit_history(server: core.Server, limit: int = 20) -> None:
     _pause()
 
 
-# ---------------------------------------------------------------------------
-# Dual-pane transfer preview (FTP2P / orthodox file-manager aesthetic)
-# ---------------------------------------------------------------------------
 
-
-def _init_transfer_colors() -> None:
-    if not curses.has_colors():
+def action_rsync_download(server: core.Server) -> None:
+    """Download remote web_remote → local web_local (simple rsync output, like upload)."""
+    local = server.web_local
+    remote = server.web_remote
+    if not local or not remote:
         return
-    # Black dual-pane look
-    curses.init_pair(20, curses.COLOR_WHITE, curses.COLOR_BLACK)  # pane text
-    curses.init_pair(21, curses.COLOR_BLACK, curses.COLOR_CYAN)  # selection
-    curses.init_pair(22, curses.COLOR_CYAN, curses.COLOR_BLACK)  # headers / dirs
-    curses.init_pair(23, curses.COLOR_YELLOW, curses.COLOR_BLACK)  # status
-    curses.init_pair(24, curses.COLOR_BLACK, curses.COLOR_WHITE)  # F-key bar
-    curses.init_pair(25, curses.COLOR_GREEN, curses.COLOR_BLACK)  # done/ok
-
-
-def _fmt_entry(name: str, is_dir: bool) -> str:
-    base = name.rstrip("/") or name
-    if is_dir:
-        return f"[{base}]"
-    return base
-
-
-def list_local_entries(root: Path, limit: int = 400) -> List[Tuple[str, bool]]:
-    """Flat list of relative entries under root (dirs first)."""
-    root = root.expanduser()
-    if not root.is_dir():
-        return []
-    dirs: List[str] = []
-    files: List[str] = []
-    try:
-        for dirpath, dirnames, filenames in os.walk(root):
-            rel_dir = os.path.relpath(dirpath, root)
-            if rel_dir == ".":
-                rel_dir = ""
-            for d in sorted(dirnames):
-                if d.startswith("."):
-                    continue
-                rel = d if not rel_dir else f"{rel_dir}/{d}"
-                dirs.append(rel.replace("\\", "/"))
-            for f in sorted(filenames):
-                if f.startswith("."):
-                    continue
-                rel = f if not rel_dir else f"{rel_dir}/{f}"
-                files.append(rel.replace("\\", "/"))
-            if len(dirs) + len(files) >= limit:
-                break
-    except OSError:
-        pass
-    out: List[Tuple[str, bool]] = [(n, True) for n in dirs[:limit]]
-    remain = max(0, limit - len(out))
-    out.extend((n, False) for n in files[:remain])
-    return out
-
-
-def list_remote_entries(server: core.Server, remote_path: str, limit: int = 400) -> List[Tuple[str, bool]]:
-    """List relative paths under remote_path via find (sudo fallback)."""
-    path = normalize_remote_path(remote_path)
-    quoted = shlex.quote(path)
-    # %P = path relative to the argument; %y = file type
-    cmd = (
-        f"find {quoted} -mindepth 1 \\( -type d -o -type f \\) "
-        f"-printf '%y\\t%P\\n' 2>/dev/null | head -n {int(limit)}"
-    )
-    code, out, _sudo = ssh_remote_capture_sudo_fallback(server, cmd, timeout=90, always_retry=True)
-    if code != 0:
-        # Fallback without -printf (BusyBox / macOS remote unlikely but safe)
-        cmd2 = f"find {quoted} -mindepth 1 2>/dev/null | head -n {int(limit)}"
-        code2, out2, _s2 = ssh_remote_capture_sudo_fallback(
-            server, cmd2, timeout=90, always_retry=True
-        )
-        if code2 != 0:
-            return []
-        entries: List[Tuple[str, bool]] = []
-        for line in out2.splitlines():
-            line = line.strip()
-            if not line.startswith(path):
-                continue
-            rel = line[len(path) :].lstrip("/")
-            if not rel or rel.startswith("."):
-                continue
-            # Heuristic: no extension and exists as dir unknown → treat trailing as file
-            entries.append((rel, False))
-        return entries[:limit]
-
-    dirs: List[str] = []
-    files: List[str] = []
-    for line in out.splitlines():
-        line = line.strip()
-        if not line or "\t" not in line:
-            # skip password prompts / noise
-            if "password" in line.lower():
-                continue
-            continue
-        kind, rel = line.split("\t", 1)
-        rel = rel.strip().replace("\\", "/")
-        if not rel or rel.startswith("."):
-            continue
-        if kind.startswith("d"):
-            dirs.append(rel.rstrip("/"))
-        else:
-            files.append(rel)
-    result: List[Tuple[str, bool]] = [(n, True) for n in sorted(set(dirs))]
-    result.extend((n, False) for n in sorted(set(files)))
-    return result[:limit]
-
-
-def _parse_rsync_line(line: str) -> Optional[str]:
-    """Extract a transferred path from rsync -i / --out-format output."""
-    line = line.strip()
-    if not line or line.startswith("sending ") or line.startswith("receiving "):
-        return None
-    if line.startswith("sent ") or line.startswith("total size"):
-        return None
-    if "password" in line.lower() and ":" in line:
-        return None
-    m = _RSYNC_ITEMIZE_RE.match(line)
-    if m:
-        name = m.group("name").strip()
-        return name.rstrip("/") if name.endswith("/") else name
-    # --out-format='%n' plain names
-    if "/" in line or "." in line:
-        # Avoid progress lines like "1,234  56%"
-        if re.match(r"^[\d,\.]+\s+\d+%", line):
-            return None
-        return line.split("\t")[0].strip() or None
-    return None
-
-
-def _stream_rsync_lines(
-    argv: List[str],
-    server: core.Server,
-    on_line: Callable[[str], None],
-    should_stop: Callable[[], bool],
-) -> int:
-    """
-    Run rsync, invoke on_line for each stdout line.
-    Password hosts: PTY + auto password, then stream without writing to the real TTY.
-    """
-    password = server.password if core.uses_yaml_password(server) else None
-    if not password:
-        proc = subprocess.Popen(
-            argv,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1,
-        )
-        assert proc.stdout is not None
-        try:
-            while True:
-                if should_stop():
-                    proc.send_signal(signal.SIGTERM)
-                    break
-                line = proc.stdout.readline()
-                if line == "" and proc.poll() is not None:
-                    break
-                if line:
-                    on_line(line.rstrip("\n"))
-        finally:
-            try:
-                proc.stdout.close()
-            except Exception:
-                pass
-        return proc.wait() if proc.poll() is None else int(proc.returncode or 0)
-
-    # Password via PTY
-    pid, master = pty.fork()
-    if pid == 0:
-        try:
-            os.execvp(argv[0], argv)
-        except OSError:
-            os._exit(127)
-
-    buf = b""
-    line_buf = b""
-    password_sent = False
-    deadline = time.time() + 45.0  # auth window
-    try:
-        while True:
-            if should_stop():
-                try:
-                    os.kill(pid, signal.SIGTERM)
-                except OSError:
-                    pass
-                break
-
-            try:
-                exited, status = os.waitpid(pid, os.WNOHANG)
-            except ChildProcessError:
-                return 1
-            if exited == pid:
-                # flush remainder
-                while True:
-                    r, _, _ = select.select([master], [], [], 0)
-                    if not r:
-                        break
-                    try:
-                        chunk = os.read(master, 4096)
-                    except OSError:
-                        break
-                    if not chunk:
-                        break
-                    line_buf += chunk
-                for raw in line_buf.splitlines():
-                    try:
-                        on_line(raw.decode("utf-8", errors="replace"))
-                    except Exception:
-                        pass
-                return _exit_status_code(status)
-
-            r, _, _ = select.select([master], [], [], 0.15)
-            if not r:
-                if not password_sent and time.time() > deadline:
-                    try:
-                        os.kill(pid, signal.SIGTERM)
-                    except OSError:
-                        pass
-                    return 124
-                continue
-            try:
-                data = os.read(master, 4096)
-            except OSError as exc:
-                if exc.errno == errno.EIO:
-                    break
-                raise
-            if not data:
-                break
-
-            if not password_sent:
-                buf += data
-                if len(buf) > 8192:
-                    buf = buf[-4096:]
-                if core._HOSTKEY_RE.search(buf):
-                    os.write(master, b"yes\n")
-                    buf = b""
-                    continue
-                if core._PASSWORD_RE.search(buf):
-                    os.write(
-                        master,
-                        password.encode("utf-8", errors="surrogateescape") + b"\n",
-                    )
-                    password_sent = True
-                    buf = b""
-                    line_buf = b""
-                    continue
-                # don't forward password prompt noise to UI
-                continue
-
-            line_buf += data
-            while b"\n" in line_buf:
-                raw, line_buf = line_buf.split(b"\n", 1)
-                try:
-                    on_line(raw.decode("utf-8", errors="replace"))
-                except Exception:
-                    pass
-
-        # EOF path
-        try:
-            _, status = os.waitpid(pid, 0)
-            return _exit_status_code(status)
-        except ChildProcessError:
-            return 1
-    finally:
-        try:
-            os.close(master)
-        except OSError:
-            pass
-
-
-def draw_dual_pane(
-    stdscr: "curses._CursesWindow",
-    *,
-    left_title: str,
-    right_title: str,
-    left_entries: List[Tuple[str, bool]],
-    right_entries: List[Tuple[str, bool]],
-    current: Optional[str],
-    status: str,
-    progress: str,
-    footer: str,
-    left_scroll: int,
-    right_scroll: int,
-) -> None:
-    """Classic black dual-pane orthodox file-manager layout."""
-    _init_transfer_colors()
-    h, w = stdscr.getmaxyx()
-    mid = max(10, w // 2)
-    left_w = mid
-    right_w = w - mid
-    body_top = 2
-    body_bot = h - 3  # status + footer
-    body_h = max(1, body_bot - body_top)
-
-    try:
-        stdscr.bkgd(" ", curses.color_pair(20))
-    except curses.error:
-        pass
-    stdscr.erase()
-
-    # Path headers
-    lh = f" {left_title}"
-    rh = f" {right_title}"
-    try:
-        stdscr.addnstr(0, 0, lh.ljust(left_w)[:left_w], left_w, curses.color_pair(22) | curses.A_BOLD)
-        stdscr.addnstr(0, mid, rh.ljust(right_w)[:right_w], right_w, curses.color_pair(22) | curses.A_BOLD)
-        stdscr.addnstr(1, 0, ("─" * left_w)[:left_w], left_w, curses.color_pair(22))
-        stdscr.addnstr(1, mid, ("─" * right_w)[:right_w], right_w, curses.color_pair(22))
-    except curses.error:
-        pass
-
-    def _paint_side(
-        x0: int,
-        width: int,
-        entries: List[Tuple[str, bool]],
-        scroll: int,
-    ) -> None:
-        visible = entries[scroll : scroll + body_h]
-        for i, (name, is_dir) in enumerate(visible):
-            y = body_top + i
-            label = " " + _fmt_entry(name, is_dir)
-            is_cur = bool(current) and (
-                name == current
-                or name.rstrip("/") == current.rstrip("/")
-                or current.rstrip("/") == name.rstrip("/")
-            )
-            attr = curses.color_pair(21) | curses.A_BOLD if is_cur else curses.color_pair(20)
-            if is_dir and not is_cur:
-                attr = curses.color_pair(22)
-            try:
-                stdscr.addnstr(y, x0, label.ljust(width)[:width], width, attr)
-            except curses.error:
-                pass
-        # clear rest
-        for i in range(len(visible), body_h):
-            y = body_top + i
-            try:
-                stdscr.addnstr(y, x0, " " * width, width, curses.color_pair(20))
-            except curses.error:
-                pass
-        # vertical divider
-        for y in range(0, h - 1):
-            try:
-                if mid < w:
-                    stdscr.addch(y, mid - 1 if mid > 0 else 0, curses.ACS_VLINE, curses.color_pair(22))
-            except curses.error:
-                pass
-
-    _paint_side(0, left_w - 1, left_entries, left_scroll)
-    _paint_side(mid, right_w, right_entries, right_scroll)
-
-    # Status / progress
-    try:
-        stdscr.addnstr(
-            h - 2,
-            0,
-            f" {progress}  {status}".ljust(w)[: max(0, w - 1)],
-            max(0, w - 1),
-            curses.color_pair(23),
-        )
-        stdscr.addnstr(
-            h - 1,
-            0,
-            footer.ljust(w)[: max(0, w - 1)],
-            max(0, w - 1),
-            curses.color_pair(24) | curses.A_BOLD,
-        )
-    except curses.error:
-        pass
-    stdscr.refresh()
-
-
-def action_rsync_download(stdscr: "curses._CursesWindow", server: core.Server) -> None:
-    """
-    Download remote web_remote → local web_local with live dual-pane preview.
-    """
-    if not server.web_local or not server.web_remote:
-        return
-    local_path = Path(server.web_local).expanduser()
-    remote = normalize_remote_path(server.web_remote)
+    local_path = Path(local).expanduser()
     try:
         local_path.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
-        core._safe_add(stdscr, 0, 0, f"Cannot create local dir: {exc}", curses.color_pair(7))
-        stdscr.refresh()
-        stdscr.getch()
+        print(f"Cannot create local dir: {exc}")
+        _pause()
         return
 
-    curses.curs_set(0)
-    _init_transfer_colors()
-
-    left_title = f"{server.user}@{server.host}:{remote}"
-    right_title = str(local_path)
-    status = "Scanning remote…"
-    progress = ""
-    footer = " F5 Download  F10 Abort/Close "
-    draw_dual_pane(
-        stdscr,
-        left_title=left_title,
-        right_title=right_title,
-        left_entries=[],
-        right_entries=list_local_entries(local_path),
-        current=None,
-        status=status,
-        progress=progress,
-        footer=footer,
-        left_scroll=0,
-        right_scroll=0,
-    )
-
-    left_entries = list_remote_entries(server, remote)
-    right_entries = list_local_entries(local_path)
-    status = f"Remote entries: {len(left_entries)} · starting rsync…"
-    draw_dual_pane(
-        stdscr,
-        left_title=left_title,
-        right_title=right_title,
-        left_entries=left_entries,
-        right_entries=right_entries,
-        current=None,
-        status=status,
-        progress=progress,
-        footer=footer,
-        left_scroll=0,
-        right_scroll=0,
-    )
-
+    remote = normalize_remote_path(remote)
     src = f"{_ssh_target(server)}:{remote}/"
     dest = str(local_path) + os.sep
     ssh_e = "ssh " + " ".join(shlex.quote(o) for o in _ssh_opts(server))
     argv = [
         "rsync",
-        "-avzi",
+        "-avz",
         "--delete",
-        "--out-format=%i %n%L",
+        "--progress",
         "-e",
         ssh_e,
         src,
         dest,
     ]
+    print(f"→ Download (rsync) from {server.label}")
+    print(f"  remote: {src}")
+    print(f"  local:  {dest}")
+    print(f"  cmd:    {' '.join(shlex.quote(a) for a in argv)}")
+    _pause("Press Enter to run rsync (Ctrl+C abort)…")
+    try:
+        code = run_argv(argv, server, interactive=True)
+    except KeyboardInterrupt:
+        print("\nCancelled.")
+        code = 130
+    print(f"rsync exit: {code}")
+    _pause()
 
-    current: Optional[str] = None
-    seen_local: Set[str] = {n for n, _ in right_entries}
-    transferred = 0
-    stop_flag = {"stop": False}
-    last_draw = 0.0
-
-    def on_line(line: str) -> None:
-        nonlocal current, transferred, right_entries, last_draw, status, progress
-        name = _parse_rsync_line(line)
-        if name:
-            current = name
-            transferred += 1
-            if name not in seen_local:
-                is_dir = name.endswith("/") or any(
-                    n == name.rstrip("/") and d for n, d in left_entries
-                )
-                clean = name.rstrip("/")
-                right_entries.append((clean, is_dir))
-                seen_local.add(clean)
-                seen_local.add(name)
-            progress = f"files {transferred}"
-            status = f"receiving {current}"
-        elif line.strip():
-            # progress / misc
-            if "%" in line:
-                progress = line.strip()[:40]
-        now = time.time()
-        if now - last_draw >= 0.05:
-            # Keep current near visible area on both sides
-            left_scroll = 0
-            right_scroll = 0
-            if current:
-                for i, (n, _) in enumerate(left_entries):
-                    if n.rstrip("/") == current.rstrip("/"):
-                        left_scroll = max(0, i - 3)
-                        break
-                for i, (n, _) in enumerate(right_entries):
-                    if n.rstrip("/") == current.rstrip("/"):
-                        right_scroll = max(0, i - 3)
-                        break
-            draw_dual_pane(
-                stdscr,
-                left_title=left_title,
-                right_title=right_title,
-                left_entries=left_entries,
-                right_entries=right_entries,
-                current=current,
-                status=status,
-                progress=progress,
-                footer=" F10 Abort ",
-                left_scroll=left_scroll,
-                right_scroll=right_scroll,
-            )
-            last_draw = now
-            # Non-blocking abort check
-            stdscr.nodelay(True)
-            try:
-                ch = stdscr.getch()
-                if ch in (curses.KEY_F10, 27, ord("q")):
-                    stop_flag["stop"] = True
-            finally:
-                stdscr.nodelay(False)
-
-    status = "Downloading (rsync -avzi --delete)…"
-    draw_dual_pane(
-        stdscr,
-        left_title=left_title,
-        right_title=right_title,
-        left_entries=left_entries,
-        right_entries=right_entries,
-        current=None,
-        status=status,
-        progress=" ".join(shlex.quote(a) for a in argv[:6]) + " …",
-        footer=" F10 Abort ",
-        left_scroll=0,
-        right_scroll=0,
-    )
-
-    code = _stream_rsync_lines(argv, server, on_line, lambda: stop_flag["stop"])
-
-    # Refresh local pane from disk
-    right_entries = list_local_entries(local_path)
-    if stop_flag["stop"]:
-        status = f"Aborted · rsync exit {code}"
-        attr_note = "aborted"
-    elif code == 0:
-        status = f"Done · {transferred} itemize lines · exit 0"
-        attr_note = "ok"
-    else:
-        status = f"Finished with errors · exit {code}"
-        attr_note = "err"
-
-    draw_dual_pane(
-        stdscr,
-        left_title=left_title,
-        right_title=right_title,
-        left_entries=left_entries,
-        right_entries=right_entries,
-        current=current,
-        status=status,
-        progress=attr_note,
-        footer=" Enter/F10 Close ",
-        left_scroll=0,
-        right_scroll=max(0, len(right_entries) - 5),
-    )
-    while True:
-        ch = stdscr.getch()
-        if ch in (curses.KEY_ENTER, 10, 13, curses.KEY_F10, 27, ord("q")):
-            break
 
 
 def host_actions_menu(
@@ -1187,7 +669,7 @@ def host_actions_menu(
         deploy_actions: List[Tuple[str, str, bool]] = []
         if can_upload:
             deploy_actions.append(("upload", "Rsync upload + fix permissions", True))
-            deploy_actions.append(("download", "Rsync download (live dual-pane)", True))
+            deploy_actions.append(("download", "Rsync download", True))
         else:
             deploy_actions.append(
                 ("upload", "Rsync upload + fix permissions  (set web_local + web_remote in Edit)", False)
@@ -1312,16 +794,11 @@ def host_actions_menu(
                     _resume_curses(stdscr)
                 status = "Upload finished."
             elif action == "download":
-                # Keep curses for dual-pane live preview
+                _suspend_curses(stdscr)
                 try:
-                    action_rsync_download(stdscr, server)
+                    action_rsync_download(server)
                 finally:
-                    try:
-                        stdscr.bkgd(" ", curses.A_NORMAL)
-                    except curses.error:
-                        pass
-                    stdscr.clear()
-                    stdscr.refresh()
+                    _resume_curses(stdscr)
                 status = "Download finished."
             elif action == "chmod":
                 _suspend_curses(stdscr)
