@@ -79,7 +79,6 @@ Runtime only — no path settings here. Missing config shows as disabled with a 
 | Fix permissions only | `web_remote` set |
 | ← / q | Back to host list |
 
-**Download preview:** black dual panes (left = remote listing, right = local as files arrive), path headers, directories as `[name]`, cyan selection on the active file, F10 abort/close. Uses `rsync -avzi --delete` plus itemize output.
 
 Each enabled run prints the command and waits for Enter before executing.
 
