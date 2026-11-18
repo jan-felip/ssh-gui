@@ -94,7 +94,10 @@ Només runtime. Si falta config, surten deshabilitades amb pista d’usar Edit.
 
 - **Git:** pull, historial  
 - **Deploy:** rsync upload (+ chmod 755/644), download, fix permissions  
-- **Vendor** (si existeix `web_remote/vendor`): Drush `cr`, `updatedb -y`, `uli`, `cim`, `cex` (fallback Remi PHP + sudo) *(Això existeix ja que habituo a treballar amb webs basades en Drupal)*
+- **Vendor** (si existeix `web_remote/vendor`): Drush `cr`, `Database: Update/Export/Import`, `uli`, `cim`, `cex` (fallback Remi PHP + sudo) *(Això existeix ja que habituo a treballar amb webs basades en Drupal)*  
+- **MySQL** (si hi ha `web_remote`): `Database: Export/Import` via `mysqldump` / `mysql` (credencials per Drush o prompt; no es desen)
+
+Export desa el dump a `web_local/db-dumps/` (fora del docroot remot). Import és destructiu (`sql:drop` / `DROP DATABASE`) amb confirmació `y/N`.
 
 Enter a un host amb `web_remote` obre l’SSH ja dins aquell directori.
 
@@ -102,7 +105,7 @@ Enter a un host amb `web_remote` obre l’SSH ja dins aquell directori.
 
 - `chmod 600 servers.yaml`
 - Preferir claus a contrasenyes / tokens en text pla
-- No commitjar mai `servers.yaml` ni `git_token` reals
+- No commitjar mai `servers.yaml`, `git_token` reals ni dumps `*.sql` / `*.sql.gz`
 
 ---
 
@@ -185,7 +188,10 @@ Runtime only. If config is missing, items show disabled with a hint to use Edit.
 
 - **Git:** pull, history  
 - **Deploy:** rsync upload (+ chmod 755/644), download, fix permissions  
-- **Vendor** (if `web_remote/vendor` exists): Drush `cr`, `updatedb -y`, `uli`, `cim`, `cex` (Remi PHP + sudo fallback) *(This exists because I usually work on Drupal-based sites)*
+- **Vendor** (if `web_remote/vendor` exists): Drush `cr`, `Database: Update/Export/Import`, `uli`, `cim`, `cex` (Remi PHP + sudo fallback) *(This exists because I usually work on Drupal-based sites)*  
+- **MySQL** (when `web_remote` is set): `Database: Export/Import` via `mysqldump` / `mysql` (creds from Drush or prompt; never saved)
+
+Export writes the dump under `web_local/db-dumps/` (remote dump stays out of the docroot). Import is destructive (`sql:drop` / `DROP DATABASE`) with a `y/N` confirm.
 
 Enter on a host with `web_remote` opens SSH already inside that directory.
 
@@ -193,7 +199,7 @@ Enter on a host with `web_remote` opens SSH already inside that directory.
 
 - `chmod 600 servers.yaml`
 - Prefer keys over plaintext passwords / tokens
-- Never commit `servers.yaml` or real `git_token` values
+- Never commit `servers.yaml`, real `git_token` values, or `*.sql` / `*.sql.gz` dumps
 
 ---
 

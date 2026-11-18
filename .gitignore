@@ -5,6 +5,11 @@ credentials*
 .env
 .env.*
 
+# Database dumps (Vendor/MySQL export — never commit)
+*.sql
+*.sql.gz
+db-dumps/
+
 # Python
 .venv/
 venv/

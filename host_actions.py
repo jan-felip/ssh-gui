@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import curses
+import getpass
+import json
 import os
 import re
 import shlex
@@ -11,14 +13,20 @@ import subprocess
 import sys
 import urllib.parse
 from dataclasses import replace
+from datetime import datetime
 from pathlib import Path
-from typing import Any, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import ssh_gui as core
 
 # Preset permission mode applied after upload (and available alone)
 PERM_PRESET_DIRS = "755"
 PERM_PRESET_FILES = "644"
+
+# Local dump folder under web_local (keep *.sql* out of git — see .gitignore)
+DB_DUMPS_SUBDIR = "db-dumps"
+_DUMP_NAME_RE = re.compile(r"^[\w.-]+\.sql(\.gz)?$", re.IGNORECASE)
+_SAFE_NAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
 
 
 def _suspend_curses(stdscr: "curses._CursesWindow") -> None:
@@ -500,15 +508,15 @@ def remi_enable_for(remi_php: str) -> str:
     return f"/opt/remi/{remi_php}/enable"
 
 
-def remi_drush_cmd(
+def remi_shell_cmd(
     path_q: str,
-    drush_args: str,
+    shell_after_cd: str,
     *,
     preferred: Optional[str] = None,
     quiet: bool = False,
 ) -> str:
     """
-    Source Remi enable then run drush.
+    Source Remi enable then run shell_after_cd (already `cd`'d into path_q).
     preferred=php83 → that path only; else first existing php81→php84.
     """
     announce = "" if quiet else 'echo "Using Remi: source $enable" >&2'
@@ -525,7 +533,7 @@ fi
 {announce}
 # shellcheck disable=SC1090
 source "$enable"
-vendor/bin/drush {drush_args}
+{shell_after_cd}
 """
     checks = " ".join(shlex.quote(p) for p in REMI_PHP_ENABLE_CANDIDATES)
     return f"""
@@ -545,8 +553,139 @@ fi
 {announce}
 # shellcheck disable=SC1090
 source "$enable"
-vendor/bin/drush {drush_args}
+{shell_after_cd}
 """
+
+
+def remi_drush_cmd(
+    path_q: str,
+    drush_args: str,
+    *,
+    preferred: Optional[str] = None,
+    quiet: bool = False,
+) -> str:
+    """Source Remi enable then run vendor/bin/drush <args>."""
+    return remi_shell_cmd(
+        path_q,
+        f"vendor/bin/drush {drush_args}",
+        preferred=preferred,
+        quiet=quiet,
+    )
+
+
+def _safe_dump_stem(server_name: str) -> str:
+    return _SAFE_NAME_RE.sub("_", server_name).strip("._") or "host"
+
+
+def _dump_stamp() -> str:
+    return datetime.now().strftime("%Y%m%d_%H%M%S")
+
+
+def _local_dumps_dir(server: core.Server) -> Optional[Path]:
+    if not server.web_local:
+        return None
+    return Path(server.web_local).expanduser().resolve() / DB_DUMPS_SUBDIR
+
+
+def _is_dump_filename(name: str) -> bool:
+    return bool(_DUMP_NAME_RE.match(name))
+
+
+def _rsync_file(
+    server: core.Server,
+    *,
+    src: str,
+    dest: str,
+) -> int:
+    """rsync a single file (src/dest may be local paths or user@host:path)."""
+    ssh_e = "ssh " + " ".join(shlex.quote(o) for o in _ssh_opts(server))
+    argv = ["rsync", "-avz", "-e", ssh_e, src, dest]
+    return run_argv(argv, server, interactive=True)
+
+
+def _exec_vendor_shell(
+    server: core.Server,
+    path: str,
+    shell_after_cd: str,
+    *,
+    config_path: Optional[Path] = None,
+    timeout: float = 600.0,
+) -> Tuple[core.Server, int, str, bool]:
+    """
+    Run shell_after_cd in web_remote: plain → sudo → Remi (+ sudo).
+    Returns (server, code, output, used_remi).
+    """
+    path_q = shlex.quote(path)
+    plain_cmd = f"cd {path_q} && {shell_after_cd}"
+    cached = server.remi_php if (server.remi_php and _REMI_PHP_RE.match(server.remi_php)) else None
+    used_sudo = False
+    used_remi = False
+    remi_enable_used = ""
+    out = ""
+    code = 1
+
+    if cached:
+        remi_cmd = remi_shell_cmd(
+            path_q, shell_after_cd, preferred=cached, quiet=True
+        )
+        code, out, used_sudo = ssh_remote_capture_sudo_fallback(
+            server, remi_cmd, timeout=timeout, always_retry=True
+        )
+        used_remi = True
+        remi_enable_used = remi_enable_for(cached)
+        if code != 0:
+            _print_red_block(
+                [
+                    f"Cached Remi {cached} failed (exit {code}).",
+                    "Retrying: plain → Remi php81–84 probe…",
+                ]
+            )
+            code, out1, used_sudo1 = ssh_remote_capture_sudo_fallback(
+                server, plain_cmd, timeout=timeout, always_retry=True
+            )
+            used_sudo = used_sudo or used_sudo1
+            if code != 0:
+                fail_lines = [ln for ln in (out1 or "").splitlines() if ln.strip()]
+                fail_lines.append(
+                    "retrying with first existing Remi enable (php81–php84) …"
+                )
+                _print_red_block(fail_lines)
+                remi_cmd = remi_shell_cmd(path_q, shell_after_cd, quiet=False)
+                code, out, used_sudo2 = ssh_remote_capture_sudo_fallback(
+                    server, remi_cmd, timeout=timeout, always_retry=True
+                )
+                used_sudo = used_sudo or used_sudo2
+                used_remi = True
+                remi_enable_used = _parse_remi_enable_used(out) or remi_enable_used
+            else:
+                out = out1
+                used_remi = False
+                remi_enable_used = ""
+    else:
+        code, out1, used_sudo = ssh_remote_capture_sudo_fallback(
+            server, plain_cmd, timeout=timeout, always_retry=True
+        )
+        if code != 0:
+            fail_lines = [ln for ln in (out1 or "").splitlines() if ln.strip()]
+            fail_lines.append(
+                "retrying with first existing Remi enable (php81–php84) …"
+            )
+            _print_red_block(fail_lines)
+            remi_cmd = remi_shell_cmd(path_q, shell_after_cd, quiet=False)
+            code, out, used_sudo2 = ssh_remote_capture_sudo_fallback(
+                server, remi_cmd, timeout=timeout, always_retry=True
+            )
+            used_sudo = used_sudo or used_sudo2
+            used_remi = True
+            remi_enable_used = _parse_remi_enable_used(out)
+        else:
+            out = out1
+
+    if code == 0 and used_remi and remi_enable_used:
+        label = remi_php_label(remi_enable_used)
+        if label:
+            server = _persist_remi_php(config_path, server, label)
+    return server, code, out, used_remi
 
 
 def _print_red_block(lines: List[str]) -> None:
@@ -769,6 +908,814 @@ def action_drush(
     )
     print()
     _pause("Press Enter to return…")
+    return server
+
+
+def pick_dump_source(stdscr: "curses._CursesWindow") -> Optional[str]:
+    """Pick Local / Remote dump. Returns 'local', 'remote', or None."""
+    options = [
+        ("local", "Local dump (.sql / .sql.gz)"),
+        ("remote", "Remote dump on host"),
+        ("cancel", "← Cancel"),
+    ]
+    focus = 0
+    curses.curs_set(0)
+    while True:
+        stdscr.clear()
+        h, w = stdscr.getmaxyx()
+        core._safe_add(stdscr, 0, 2, "Database import — pick dump source", curses.A_BOLD)
+        core._safe_add(
+            stdscr,
+            1,
+            2,
+            "↑↓ move · Enter select · Esc cancel",
+            curses.color_pair(2),
+        )
+        for i, (_id, label) in enumerate(options):
+            y = 3 + i
+            selected = i == focus
+            if selected:
+                try:
+                    stdscr.addnstr(y, 0, " " * max(0, w - 1), w - 1, curses.color_pair(1))
+                except curses.error:
+                    pass
+                attr = curses.color_pair(1) | curses.A_BOLD
+            else:
+                attr = curses.A_NORMAL
+            core._safe_add(stdscr, y, 2, label[: max(0, w - 3)], attr)
+        stdscr.refresh()
+        key = stdscr.getch()
+        if key in (curses.KEY_UP, ord("k")):
+            focus = (focus - 1) % len(options)
+        elif key in (curses.KEY_DOWN, ord("j")):
+            focus = (focus + 1) % len(options)
+        elif key in (27,):
+            return None
+        elif key in (curses.KEY_ENTER, 10, 13):
+            chosen = options[focus][0]
+            return None if chosen == "cancel" else chosen
+
+
+def pick_local_dump_file(
+    stdscr: "curses._CursesWindow",
+    start: Optional[str] = None,
+) -> Optional[str]:
+    """Browse local dirs; Enter on .sql/.sql.gz selects the file."""
+    cwd = Path(start or Path.home()).expanduser().resolve()
+    if not cwd.is_dir():
+        cwd = Path.home()
+    idx = 0
+    curses.curs_set(0)
+
+    while True:
+        try:
+            dirs = sorted(
+                [p for p in cwd.iterdir() if p.is_dir() and not p.name.startswith(".")],
+                key=lambda p: p.name.lower(),
+            )
+            dumps = sorted(
+                [
+                    p
+                    for p in cwd.iterdir()
+                    if p.is_file() and _is_dump_filename(p.name)
+                ],
+                key=lambda p: p.name.lower(),
+            )
+        except PermissionError:
+            dirs, dumps = [], []
+
+        rows: List[Tuple[str, Optional[Path], str]] = []
+        if cwd.parent != cwd:
+            rows.append(("[..]", cwd.parent, "dir"))
+        for p in dirs:
+            rows.append((p.name + "/", p, "dir"))
+        for p in dumps:
+            rows.append((p.name, p, "file"))
+
+        stdscr.clear()
+        h, w = stdscr.getmaxyx()
+        core._safe_add(stdscr, 0, 0, "Pick local dump (.sql / .sql.gz)", curses.A_BOLD)
+        core._safe_add(
+            stdscr,
+            1,
+            0,
+            "↑↓ move · Enter open/select · ← up · Esc cancel",
+            curses.color_pair(2),
+        )
+        core._safe_add(stdscr, 2, 0, str(cwd)[: max(0, w - 1)], curses.A_DIM)
+
+        if not rows:
+            core._safe_add(stdscr, 4, 2, "(no folders or dumps here)", curses.A_DIM)
+
+        top = 4
+        visible = max(1, h - top - 1)
+        idx = max(0, min(idx, max(0, len(rows) - 1)))
+        start_i = max(0, min(idx - visible + 1, max(0, len(rows) - visible)))
+        for row_i, (label, _path, _kind) in enumerate(rows[start_i : start_i + visible]):
+            y = top + row_i
+            selected = (start_i + row_i) == idx
+            attr = curses.color_pair(1) | curses.A_BOLD if selected else curses.A_NORMAL
+            if selected:
+                try:
+                    stdscr.addnstr(y, 0, " " * max(0, w - 1), w - 1, curses.color_pair(1))
+                except curses.error:
+                    pass
+            core._safe_add(stdscr, y, 2, label[: max(0, w - 3)], attr)
+
+        stdscr.refresh()
+        key = stdscr.getch()
+        if not rows:
+            if key in (27, ord("q"), curses.KEY_LEFT):
+                if cwd.parent != cwd:
+                    cwd = cwd.parent
+                    idx = 0
+                else:
+                    return None
+            continue
+        if key in (curses.KEY_UP, ord("k")):
+            idx = (idx - 1) % len(rows)
+        elif key in (curses.KEY_DOWN, ord("j")):
+            idx = (idx + 1) % len(rows)
+        elif key in (curses.KEY_LEFT,):
+            if cwd.parent != cwd:
+                cwd = cwd.parent
+                idx = 0
+        elif key in (27, ord("q")):
+            return None
+        elif key in (curses.KEY_ENTER, 10, 13):
+            _label, path, kind = rows[idx]
+            if path is None:
+                continue
+            if kind == "dir":
+                cwd = path
+                idx = 0
+            else:
+                return str(path)
+
+
+def _remote_list_entries(
+    server: core.Server, remote_dir: str
+) -> Tuple[int, List[Tuple[str, str]]]:
+    """List remote dir → (code, [(name, 'dir'|'file'), ...]). Dumps + dirs only."""
+    path_q = shlex.quote(remote_dir)
+    # Portable listing (no GNU find -printf). Emits name<TAB>d|f
+    cmd = f"""
+d={path_q}
+if [ ! -d "$d" ]; then
+  echo "NOTDIR" >&2
+  exit 2
+fi
+python3 -c 'import os,sys
+root=sys.argv[1]
+for name in sorted(os.listdir(root), key=str.lower):
+  if name.startswith("."): continue
+  p=os.path.join(root,name)
+  print(name+"\\t"+("d" if os.path.isdir(p) else "f"))
+' "$d" 2>/dev/null || {{
+  for p in "$d"/* "$d"/.[!.]* "$d"/..?*; do
+    [ -e "$p" ] || continue
+    n=$(basename "$p")
+    case "$n" in .|..) continue ;; esac
+    if [ -d "$p" ]; then printf '%s\\td\\n' "$n"
+    elif [ -f "$p" ]; then printf '%s\\tf\\n' "$n"
+    fi
+  done
+}}
+"""
+    code, out, _sudo = ssh_remote_capture_sudo_fallback(
+        server, cmd, timeout=60.0, always_retry=True
+    )
+    if code != 0:
+        return code, []
+    entries: List[Tuple[str, str]] = []
+    for line in (out or "").splitlines():
+        line = line.strip()
+        if not line or "\t" not in line:
+            continue
+        name, kind = line.split("\t", 1)
+        name = name.strip()
+        if not name or name.startswith("."):
+            continue
+        if kind.startswith("d"):
+            entries.append((name, "dir"))
+        elif kind.startswith("f") and _is_dump_filename(name):
+            entries.append((name, "file"))
+    entries.sort(key=lambda t: (0 if t[1] == "dir" else 1, t[0].lower()))
+    return 0, entries
+
+
+def pick_remote_dump_file(
+    stdscr: "curses._CursesWindow",
+    server: core.Server,
+    start: Optional[str] = None,
+) -> Optional[str]:
+    """Browse remote dirs over SSH; Enter selects a .sql/.sql.gz file."""
+    cwd = normalize_remote_path(start or "/tmp") or "/tmp"
+    idx = 0
+    status = ""
+    curses.curs_set(0)
+
+    while True:
+        code, entries = _remote_list_entries(server, cwd)
+        if code != 0:
+            status = f"List failed (exit {code}). ← up or Esc."
+            entries = []
+        else:
+            status = ""
+
+        rows: List[Tuple[str, Optional[str], str]] = []
+        parent = str(Path(cwd).parent) if cwd not in ("/", "") else None
+        if parent and parent != cwd:
+            rows.append(("[..]", parent, "dir"))
+        for name, kind in entries:
+            label = name + ("/" if kind == "dir" else "")
+            path = cwd.rstrip("/") + "/" + name if cwd != "/" else "/" + name
+            rows.append((label, path, kind))
+
+        stdscr.clear()
+        h, w = stdscr.getmaxyx()
+        core._safe_add(stdscr, 0, 0, "Pick remote dump (.sql / .sql.gz)", curses.A_BOLD)
+        core._safe_add(
+            stdscr,
+            1,
+            0,
+            "↑↓ move · Enter open/select · ← up · Esc cancel",
+            curses.color_pair(2),
+        )
+        core._safe_add(stdscr, 2, 0, f"{server.label}:{cwd}"[: max(0, w - 1)], curses.A_DIM)
+        if status:
+            core._safe_add(stdscr, 3, 0, status[: max(0, w - 1)], curses.color_pair(7))
+
+        top = 5
+        visible = max(1, h - top - 1)
+        idx = max(0, min(idx, max(0, len(rows) - 1)))
+        start_i = max(0, min(idx - visible + 1, max(0, len(rows) - visible)))
+        if not rows:
+            core._safe_add(stdscr, top, 2, "(empty — no dumps/dirs)", curses.A_DIM)
+        for row_i, (label, _path, _kind) in enumerate(rows[start_i : start_i + visible]):
+            y = top + row_i
+            selected = (start_i + row_i) == idx
+            attr = curses.color_pair(1) | curses.A_BOLD if selected else curses.A_NORMAL
+            if selected:
+                try:
+                    stdscr.addnstr(y, 0, " " * max(0, w - 1), w - 1, curses.color_pair(1))
+                except curses.error:
+                    pass
+            core._safe_add(stdscr, y, 2, label[: max(0, w - 3)], attr)
+
+        stdscr.refresh()
+        key = stdscr.getch()
+        if not rows:
+            if key in (27, ord("q")):
+                return None
+            if key in (curses.KEY_LEFT,) and parent:
+                cwd = parent
+                idx = 0
+            continue
+        if key in (curses.KEY_UP, ord("k")):
+            idx = (idx - 1) % len(rows)
+        elif key in (curses.KEY_DOWN, ord("j")):
+            idx = (idx + 1) % len(rows)
+        elif key in (curses.KEY_LEFT,):
+            if parent:
+                cwd = parent
+                idx = 0
+        elif key in (27, ord("q")):
+            return None
+        elif key in (curses.KEY_ENTER, 10, 13):
+            _label, path, kind = rows[idx]
+            if not path:
+                continue
+            if kind == "dir":
+                cwd = path
+                idx = 0
+            else:
+                return path
+
+
+def _prompt_mysql_creds_manual() -> Optional[Dict[str, str]]:
+    """Interactive MySQL connection (password not saved)."""
+    print("MySQL credentials (not saved to YAML):")
+    try:
+        host = input("  host [127.0.0.1]: ").strip() or "127.0.0.1"
+        port = input("  port [3306]: ").strip() or "3306"
+        user = input("  user: ").strip()
+        database = input("  database: ").strip()
+        password = getpass.getpass("  password: ")
+    except (EOFError, KeyboardInterrupt):
+        print(f"\n{_CANCEL_HINT}")
+        return None
+    if not user or not database:
+        print("user and database are required.")
+        return None
+    return {
+        "host": host,
+        "port": port,
+        "username": user,
+        "database": database,
+        "password": password,
+    }
+
+
+def _parse_drush_sql_conf(out: str) -> Optional[Dict[str, str]]:
+    text = (out or "").strip()
+    if not text:
+        return None
+    # Drush may print warnings before JSON — take last {...} block
+    start = text.find("{")
+    end = text.rfind("}")
+    if start < 0 or end <= start:
+        return None
+    try:
+        data = json.loads(text[start : end + 1])
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(data, dict):
+        return None
+    # Flatten possible nested default.default
+    if "database" not in data and isinstance(data.get("default"), dict):
+        inner = data["default"]
+        if isinstance(inner.get("default"), dict):
+            data = inner["default"]
+        else:
+            data = inner
+    db = str(data.get("database") or data.get("databaseName") or "").strip()
+    user = str(data.get("username") or data.get("user") or "").strip()
+    if not db or not user:
+        return None
+    return {
+        "database": db,
+        "username": user,
+        "password": str(data.get("password") or ""),
+        "host": str(data.get("host") or "127.0.0.1"),
+        "port": str(data.get("port") or "3306"),
+    }
+
+
+def resolve_mysql_creds(
+    server: core.Server,
+    *,
+    config_path: Optional[Path] = None,
+    has_vendor: bool = False,
+) -> Tuple[core.Server, Optional[Dict[str, str]]]:
+    """
+    Resolve DB creds for mysqldump/mysql.
+    Prefer drush sql:conf when vendor exists; else prompt (never write password to YAML).
+    """
+    if has_vendor and server.web_remote:
+        path = normalize_remote_path(server.web_remote)
+        server, code, out, _remi = _exec_vendor_shell(
+            server,
+            path,
+            "vendor/bin/drush sql:conf --show-passwords --format=json",
+            config_path=config_path,
+            timeout=60.0,
+        )
+        if code == 0:
+            creds = _parse_drush_sql_conf(out)
+            if creds and creds.get("password") is not None and creds.get("database"):
+                return server, creds
+        print(_c(_ANSI_YELLOW, "Could not read DB password via Drush — enter manually."))
+    return server, _prompt_mysql_creds_manual()
+
+
+def _mysql_defaults_file_remote_script(creds: Dict[str, str], conf_path: str) -> str:
+    """Write a chmod 600 mysql defaults file on the remote (then caller deletes)."""
+    # Avoid echoing password in process list / shell history via quoted heredoc
+    user_q = shlex.quote(creds["username"])
+    host_q = shlex.quote(creds["host"])
+    port_q = shlex.quote(str(creds["port"]))
+    pass_q = shlex.quote(creds.get("password") or "")
+    conf_q = shlex.quote(conf_path)
+    return f"""
+umask 077
+printf '%s\\n' '[client]' > {conf_q}
+printf 'user=%s\\n' {user_q} >> {conf_q}
+printf 'password=%s\\n' {pass_q} >> {conf_q}
+printf 'host=%s\\n' {host_q} >> {conf_q}
+printf 'port=%s\\n' {port_q} >> {conf_q}
+chmod 600 {conf_q}
+"""
+
+
+def action_db_export_drush(
+    server: core.Server,
+    *,
+    config_path: Optional[Path] = None,
+) -> core.Server:
+    """Drush sql:dump on remote → rsync into web_local/db-dumps/."""
+    if not server.web_remote or not server.web_local:
+        return server
+    path = normalize_remote_path(server.web_remote)
+    local_dir = _local_dumps_dir(server)
+    assert local_dir is not None
+    stamp = _dump_stamp()
+    fname = f"{_safe_dump_stem(server.name)}_{stamp}.sql.gz"
+    remote_dump = f"/tmp/{fname}"
+    local_path = local_dir / fname
+
+    _print_info_panel(
+        "Database: Export (Vendor / Drush)",
+        [
+            f"host:    {server.label}",
+            f"remote:  {path}",
+            f"dump:    {remote_dump}",
+            f"local:   {local_path}",
+            "cmd:     vendor/bin/drush sql:dump --gzip --result-file=…",
+            "note:    dump written under /tmp then rsynced; remote file removed",
+            "confirm: y to run · Enter/N cancels",
+        ],
+    )
+    if not _confirm_yn("Export database via Drush + rsync to local?", default_yes=False):
+        return server
+
+    try:
+        local_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        print(f"Cannot create {local_dir}: {exc}")
+        _pause()
+        return server
+
+    remote_q = shlex.quote(remote_dump)
+    shell = (
+        f"vendor/bin/drush sql:dump --gzip --result-file={remote_q} "
+        f"&& test -f {remote_q}"
+    )
+    print()
+    try:
+        server, code, out, _remi = _exec_vendor_shell(
+            server, path, shell, config_path=config_path, timeout=900.0
+        )
+    except KeyboardInterrupt:
+        print(f"\n{_CANCEL_HINT}")
+        return server
+
+    if code != 0:
+        _print_error_panel(
+            "Drush dump failed",
+            [f"host: {server.label}", f"path: {path}", f"exit: {code}"],
+            out,
+        )
+        _pause("Press Enter to return…")
+        return server
+
+    for line in (out or "").splitlines():
+        _print_drush_output_line(line, quiet=False)
+    print(_c(_ANSI_CYAN_DIM, f"  rsync → {local_path}"))
+    try:
+        rc = _rsync_file(
+            server,
+            src=f"{_ssh_target(server)}:{remote_dump}",
+            dest=str(local_path),
+        )
+    except KeyboardInterrupt:
+        print(f"\n{_CANCEL_HINT}")
+        return server
+
+    # Best-effort remote cleanup (never leave dump in /tmp longer than needed)
+    ssh_remote_capture_sudo_fallback(
+        server, f"rm -f {remote_q}", timeout=30.0, always_retry=True
+    )
+
+    if rc != 0:
+        _print_error_panel(
+            "rsync of dump failed",
+            [f"src: {remote_dump}", f"dest: {local_path}", f"exit: {rc}"],
+            "",
+        )
+        _pause("Press Enter to return…")
+        return server
+
+    _print_success_line(f"[success] Exported → {local_path}")
+    print()
+    _pause()
+    return server
+
+
+def action_db_import_drush(
+    server: core.Server,
+    dump_path: str,
+    *,
+    source: str,
+    config_path: Optional[Path] = None,
+) -> core.Server:
+    """Import dump via Drush sql:drop + sql:cli (destructive)."""
+    if not server.web_remote:
+        return server
+    path = normalize_remote_path(server.web_remote)
+    is_local = source == "local"
+    stamp = _dump_stamp()
+    base = Path(dump_path).name
+    if not _is_dump_filename(base):
+        print(f"Not a dump file: {base}")
+        _pause()
+        return server
+    remote_dump = f"/tmp/ssh-gui-import-{_safe_dump_stem(server.name)}-{stamp}-{base}"
+
+    _print_info_panel(
+        "Database: Import (Vendor / Drush)",
+        [
+            f"host:    {server.label}",
+            f"path:    {path}",
+            f"source:  {source} → {dump_path}",
+            f"remote:  {remote_dump}",
+            "cmd:     drush sql:drop -y && drush sql:cli < dump",
+            "warn:    DESTRUCTIVE — replaces the remote database",
+            "confirm: y to run · Enter/N cancels",
+        ],
+    )
+    if not _confirm_yn("DROP remote DB and import this dump?", default_yes=False):
+        return server
+
+    remote_q = shlex.quote(remote_dump)
+    try:
+        if is_local:
+            local = Path(dump_path).expanduser().resolve()
+            if not local.is_file():
+                print(f"Missing local file: {local}")
+                _pause()
+                return server
+            print(_c(_ANSI_CYAN_DIM, f"  rsync {local} → {remote_dump}"))
+            rc = _rsync_file(
+                server,
+                src=str(local),
+                dest=f"{_ssh_target(server)}:{remote_dump}",
+            )
+            if rc != 0:
+                _print_error_panel("rsync upload failed", [f"exit: {rc}"], "")
+                _pause()
+                return server
+        else:
+            src_q = shlex.quote(dump_path)
+            code, out, _s = ssh_remote_capture_sudo_fallback(
+                server,
+                f"cp -f {src_q} {remote_q} && chmod 600 {remote_q}",
+                timeout=120.0,
+                always_retry=True,
+            )
+            if code != 0:
+                _print_error_panel("Copy remote dump failed", [f"exit: {code}"], out)
+                _pause()
+                return server
+
+        if base.lower().endswith(".gz"):
+            ingest = f"gunzip -c {remote_q} | vendor/bin/drush sql:cli"
+        else:
+            ingest = f"vendor/bin/drush sql:cli < {remote_q}"
+        shell = f"vendor/bin/drush sql:drop -y && {ingest}"
+        server, code, out, _remi = _exec_vendor_shell(
+            server, path, shell, config_path=config_path, timeout=900.0
+        )
+    except KeyboardInterrupt:
+        print(f"\n{_CANCEL_HINT}")
+        ssh_remote_capture_sudo_fallback(
+            server, f"rm -f {remote_q}", timeout=30.0, always_retry=True
+        )
+        return server
+
+    ssh_remote_capture_sudo_fallback(
+        server, f"rm -f {remote_q}", timeout=30.0, always_retry=True
+    )
+
+    if code != 0:
+        _print_error_panel(
+            "Drush import failed",
+            [f"host: {server.label}", f"path: {path}", f"exit: {code}"],
+            out,
+        )
+        _pause("Press Enter to return…")
+        return server
+
+    for line in (out or "").splitlines():
+        _print_drush_output_line(line, quiet=False)
+    _print_success_line("[success] Database import finished.")
+    print()
+    _pause()
+    return server
+
+
+def action_db_export_mysql(
+    server: core.Server,
+    *,
+    config_path: Optional[Path] = None,
+    has_vendor: bool = False,
+) -> core.Server:
+    """mysqldump on remote (Walker flags) → rsync to web_local/db-dumps/."""
+    if not server.web_remote or not server.web_local:
+        return server
+    local_dir = _local_dumps_dir(server)
+    assert local_dir is not None
+    stamp = _dump_stamp()
+    fname = f"{_safe_dump_stem(server.name)}_{stamp}.sql.gz"
+    remote_dump = f"/tmp/{fname}"
+    conf_path = f"/tmp/ssh-gui-my-{_safe_dump_stem(server.name)}-{stamp}.cnf"
+    local_path = local_dir / fname
+
+    _print_info_panel(
+        "Database: Export (MySQL)",
+        [
+            f"host:    {server.label}",
+            f"dump:    {remote_dump}",
+            f"local:   {local_path}",
+            "cmd:     mysqldump --single-transaction --quick --lock-tables=false | gzip",
+            "creds:   Drush sql:conf if Vendor, else prompt (not saved)",
+            "confirm: y to run · Enter/N cancels",
+        ],
+    )
+    if not _confirm_yn("Export database via mysqldump + rsync?", default_yes=False):
+        return server
+
+    server, creds = resolve_mysql_creds(
+        server, config_path=config_path, has_vendor=has_vendor
+    )
+    if not creds:
+        _pause()
+        return server
+
+    try:
+        local_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        print(f"Cannot create {local_dir}: {exc}")
+        _pause()
+        return server
+
+    db_q = shlex.quote(creds["database"])
+    remote_q = shlex.quote(remote_dump)
+    conf_q = shlex.quote(conf_path)
+    script = _mysql_defaults_file_remote_script(creds, conf_path) + f"""
+set -e
+mysqldump --defaults-extra-file={conf_q} --single-transaction --quick --lock-tables=false {db_q} \
+  | gzip > {remote_q}
+test -s {remote_q}
+rm -f {conf_q}
+"""
+    print()
+    try:
+        code, out, used_sudo = ssh_remote_capture_sudo_fallback(
+            server, script, timeout=900.0, always_retry=True
+        )
+    except KeyboardInterrupt:
+        print(f"\n{_CANCEL_HINT}")
+        ssh_remote_capture(
+            server, f"rm -f {shlex.quote(conf_path)} {remote_q}", timeout=30.0
+        )
+        return server
+
+    # Always scrub defaults file
+    ssh_remote_capture(server, f"rm -f {conf_q}", timeout=15.0)
+
+    if code != 0:
+        # Redact password-looking lines just in case
+        safe_out = re.sub(r"(?i)password\s*=\s*.*", "password=***", out or "")
+        _print_error_panel(
+            "mysqldump failed",
+            [f"host: {server.label}", f"db: {creds['database']}", f"exit: {code}",
+             f"sudo: {used_sudo}"],
+            safe_out,
+        )
+        _pause()
+        return server
+
+    print(_c(_ANSI_CYAN_DIM, f"  rsync → {local_path}"))
+    try:
+        rc = _rsync_file(
+            server,
+            src=f"{_ssh_target(server)}:{remote_dump}",
+            dest=str(local_path),
+        )
+    except KeyboardInterrupt:
+        print(f"\n{_CANCEL_HINT}")
+        return server
+
+    ssh_remote_capture_sudo_fallback(
+        server, f"rm -f {remote_q}", timeout=30.0, always_retry=True
+    )
+    if rc != 0:
+        _print_error_panel("rsync of dump failed", [f"exit: {rc}"], "")
+        _pause()
+        return server
+
+    _print_success_line(f"[success] Exported → {local_path}")
+    print()
+    _pause()
+    return server
+
+
+def action_db_import_mysql(
+    server: core.Server,
+    dump_path: str,
+    *,
+    source: str,
+    config_path: Optional[Path] = None,
+    has_vendor: bool = False,
+) -> core.Server:
+    """Import dump with mysql client (DROP/CREATE database first)."""
+    if not server.web_remote:
+        return server
+    is_local = source == "local"
+    stamp = _dump_stamp()
+    base = Path(dump_path).name
+    if not _is_dump_filename(base):
+        print(f"Not a dump file: {base}")
+        _pause()
+        return server
+    remote_dump = f"/tmp/ssh-gui-import-{_safe_dump_stem(server.name)}-{stamp}-{base}"
+    conf_path = f"/tmp/ssh-gui-my-{_safe_dump_stem(server.name)}-{stamp}.cnf"
+
+    _print_info_panel(
+        "Database: Import (MySQL)",
+        [
+            f"host:    {server.label}",
+            f"source:  {source} → {dump_path}",
+            f"remote:  {remote_dump}",
+            "cmd:     DROP/CREATE database · mysql < dump",
+            "warn:    DESTRUCTIVE — replaces the remote database",
+            "confirm: y to run · Enter/N cancels",
+        ],
+    )
+    if not _confirm_yn("DROP remote DB and import this dump via mysql?", default_yes=False):
+        return server
+
+    server, creds = resolve_mysql_creds(
+        server, config_path=config_path, has_vendor=has_vendor
+    )
+    if not creds:
+        _pause()
+        return server
+
+    remote_q = shlex.quote(remote_dump)
+    conf_q = shlex.quote(conf_path)
+    db_q = shlex.quote(creds["database"])
+    db_ident = creds["database"].replace("`", "``")
+    drop_sql_q = shlex.quote(
+        f"DROP DATABASE IF EXISTS `{db_ident}`; CREATE DATABASE `{db_ident}`;"
+    )
+    try:
+        if is_local:
+            local = Path(dump_path).expanduser().resolve()
+            if not local.is_file():
+                print(f"Missing local file: {local}")
+                _pause()
+                return server
+            print(_c(_ANSI_CYAN_DIM, f"  rsync {local} → {remote_dump}"))
+            rc = _rsync_file(
+                server,
+                src=str(local),
+                dest=f"{_ssh_target(server)}:{remote_dump}",
+            )
+            if rc != 0:
+                _print_error_panel("rsync upload failed", [f"exit: {rc}"], "")
+                _pause()
+                return server
+        else:
+            src_q = shlex.quote(dump_path)
+            code, out, _s = ssh_remote_capture_sudo_fallback(
+                server,
+                f"cp -f {src_q} {remote_q} && chmod 600 {remote_q}",
+                timeout=120.0,
+                always_retry=True,
+            )
+            if code != 0:
+                _print_error_panel("Copy remote dump failed", [f"exit: {code}"], out)
+                _pause()
+                return server
+
+        if base.lower().endswith(".gz"):
+            load = f"gunzip -c {remote_q} | mysql --defaults-extra-file={conf_q} {db_q}"
+        else:
+            load = f"mysql --defaults-extra-file={conf_q} {db_q} < {remote_q}"
+        script = _mysql_defaults_file_remote_script(creds, conf_path) + f"""
+set -e
+mysql --defaults-extra-file={conf_q} -e {drop_sql_q}
+{load}
+rm -f {conf_q} {remote_q}
+"""
+        code, out, used_sudo = ssh_remote_capture_sudo_fallback(
+            server, script, timeout=900.0, always_retry=True
+        )
+    except KeyboardInterrupt:
+        print(f"\n{_CANCEL_HINT}")
+        ssh_remote_capture(
+            server, f"rm -f {conf_q} {remote_q}", timeout=30.0
+        )
+        return server
+
+    ssh_remote_capture(server, f"rm -f {conf_q} {remote_q}", timeout=15.0)
+
+    if code != 0:
+        safe_out = re.sub(r"(?i)password\s*=\s*.*", "password=***", out or "")
+        _print_error_panel(
+            "mysql import failed",
+            [f"host: {server.label}", f"db: {creds['database']}", f"exit: {code}",
+             f"sudo: {used_sudo}"],
+            safe_out,
+        )
+        _pause()
+        return server
+
+    _print_success_line("[success] MySQL import finished.")
+    print()
+    _pause()
     return server
 
 
@@ -1188,18 +2135,43 @@ def host_actions_menu(
         # Vendor group only when remote web_remote/vendor exists
         vendor_actions: List[Tuple[str, str, bool]] = []
         if has_vendor:
+            can_db_xfer = bool(has_local)
             vendor_actions = [
                 ("drush_cr", "Rebuild cache", True),
-                ("drush_updb", "Update Database", True),
+                ("drush_updb", "Database: Update", True),
+                (
+                    "drush_db_export",
+                    "Database: Export"
+                    if can_db_xfer
+                    else "Database: Export  (set web_local in Edit)",
+                    can_db_xfer,
+                ),
+                ("drush_db_import", "Database: Import", True),
                 ("drush_uli", "Admin login", True),
                 ("drush_cim", "Config: Import", True),
                 ("drush_cex", "Config: Export", True),
+            ]
+
+        # MySQL group when web_remote is set (raw mysqldump/mysql)
+        mysql_actions: List[Tuple[str, str, bool]] = []
+        if has_remote:
+            can_db_xfer = bool(has_local)
+            mysql_actions = [
+                (
+                    "mysql_db_export",
+                    "Database: Export"
+                    if can_db_xfer
+                    else "Database: Export  (set web_local in Edit)",
+                    can_db_xfer,
+                ),
+                ("mysql_db_import", "Database: Import", True),
             ]
 
         selectable: List[Tuple[str, str, bool]] = [
             *git_actions,
             *deploy_actions,
             *vendor_actions,
+            *mysql_actions,
             ("back", "← Back to host list", True),
         ]
 
@@ -1207,6 +2179,7 @@ def host_actions_menu(
         git_n = len(git_actions)
         deploy_n = len(deploy_actions)
         vendor_n = len(vendor_actions)
+        mysql_n = len(mysql_actions)
         display: List[Tuple[str, Any]] = [
             ("section", "Git"),
             *[("item", i) for i in range(git_n)],
@@ -1216,6 +2189,11 @@ def host_actions_menu(
         if vendor_n:
             display.append(("section", "Vendor"))
             display.extend(("item", git_n + deploy_n + i) for i in range(vendor_n))
+        if mysql_n:
+            display.append(("section", "MySQL"))
+            display.extend(
+                ("item", git_n + deploy_n + vendor_n + i) for i in range(mysql_n)
+            )
         display.append(("blank", None))
         display.append(("item", len(selectable) - 1))  # back
 
@@ -1342,13 +2320,52 @@ def host_actions_menu(
                 try:
                     server = action_drush(
                         server,
-                        "Update Database",
+                        "Database: Update",
                         "updatedb -y",
                         config_path=config_path,
                     )
                 finally:
                     _resume_curses(stdscr)
-                status = "Update Database finished."
+                status = "Database: Update finished."
+            elif action == "drush_db_export":
+                _suspend_curses(stdscr)
+                try:
+                    server = action_db_export_drush(server, config_path=config_path)
+                finally:
+                    _resume_curses(stdscr)
+                status = "Database: Export (Vendor) finished."
+            elif action == "drush_db_import":
+                source = pick_dump_source(stdscr)
+                dump: Optional[str] = None
+                if source == "local":
+                    start = None
+                    dumps = _local_dumps_dir(server)
+                    if dumps and dumps.is_dir():
+                        start = str(dumps)
+                    elif server.web_local:
+                        start = server.web_local
+                    dump = pick_local_dump_file(stdscr, start)
+                elif source == "remote":
+                    start_r = "/tmp"
+                    if server.web_remote:
+                        parent = str(Path(normalize_remote_path(server.web_remote)).parent)
+                        if parent:
+                            start_r = parent
+                    dump = pick_remote_dump_file(stdscr, server, start_r)
+                if source and dump:
+                    _suspend_curses(stdscr)
+                    try:
+                        server = action_db_import_drush(
+                            server,
+                            dump,
+                            source=source,
+                            config_path=config_path,
+                        )
+                    finally:
+                        _resume_curses(stdscr)
+                    status = "Database: Import (Vendor) finished."
+                else:
+                    status = "Import cancelled."
             elif action == "drush_uli":
                 _suspend_curses(stdscr)
                 try:
@@ -1376,3 +2393,47 @@ def host_actions_menu(
                 finally:
                     _resume_curses(stdscr)
                 status = "Config export finished."
+            elif action == "mysql_db_export":
+                _suspend_curses(stdscr)
+                try:
+                    server = action_db_export_mysql(
+                        server,
+                        config_path=config_path,
+                        has_vendor=bool(has_vendor),
+                    )
+                finally:
+                    _resume_curses(stdscr)
+                status = "Database: Export (MySQL) finished."
+            elif action == "mysql_db_import":
+                source = pick_dump_source(stdscr)
+                dump = None
+                if source == "local":
+                    start = None
+                    dumps = _local_dumps_dir(server)
+                    if dumps and dumps.is_dir():
+                        start = str(dumps)
+                    elif server.web_local:
+                        start = server.web_local
+                    dump = pick_local_dump_file(stdscr, start)
+                elif source == "remote":
+                    start_r = "/tmp"
+                    if server.web_remote:
+                        parent = str(Path(normalize_remote_path(server.web_remote)).parent)
+                        if parent:
+                            start_r = parent
+                    dump = pick_remote_dump_file(stdscr, server, start_r)
+                if source and dump:
+                    _suspend_curses(stdscr)
+                    try:
+                        server = action_db_import_mysql(
+                            server,
+                            dump,
+                            source=source,
+                            config_path=config_path,
+                            has_vendor=bool(has_vendor),
+                        )
+                    finally:
+                        _resume_curses(stdscr)
+                    status = "Database: Import (MySQL) finished."
+                else:
+                    status = "Import cancelled."
