@@ -95,7 +95,7 @@ Només runtime. Si falta config, surten deshabilitades amb pista d’usar Edit.
 - **Git:** pull, historial  
 - **Deploy:** rsync upload (+ chmod 755/644), download, fix permissions  
 - **Vendor** (si existeix `web_remote/vendor`): Drush `cr`, `Database: Update/Export/Import`, `uli`, `cim`, `cex` (fallback Remi PHP + sudo) *(Això existeix ja que habituo a treballar amb webs basades en Drupal)*  
-- **MySQL** (si hi ha `web_remote`): `Database: Export/Import` via `mysqldump` / `mysql` (credencials per Drush o prompt; no es desen)
+- **MySQL** (si hi ha `web_remote`): `Database: Export/Import` via `mysqldump` / `mysql` (Drush → YAML → prompt; després d’èxit pots desar `mysql_*` al YAML)
 
 Export desa el dump a `web_local/db-dumps/` (fora del docroot remot). Import és destructiu (`sql:drop` / `DROP DATABASE`) amb confirmació `y/N`.
 
@@ -189,7 +189,7 @@ Runtime only. If config is missing, items show disabled with a hint to use Edit.
 - **Git:** pull, history  
 - **Deploy:** rsync upload (+ chmod 755/644), download, fix permissions  
 - **Vendor** (if `web_remote/vendor` exists): Drush `cr`, `Database: Update/Export/Import`, `uli`, `cim`, `cex` (Remi PHP + sudo fallback) *(This exists because I usually work on Drupal-based sites)*  
-- **MySQL** (when `web_remote` is set): `Database: Export/Import` via `mysqldump` / `mysql` (creds from Drush or prompt; never saved)
+- **MySQL** (when `web_remote` is set): `Database: Export/Import` via `mysqldump` / `mysql` (Drush → YAML → prompt; after success you can save `mysql_*` to YAML)
 
 Export writes the dump under `web_local/db-dumps/` (remote dump stays out of the docroot). Import is destructive (`sql:drop` / `DROP DATABASE`) with a `y/N` confirm.
 

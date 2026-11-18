@@ -234,9 +234,41 @@ def ssh_remote_capture(server: core.Server, remote_cmd: str, timeout: float = 60
     return _ssh_capture_with_password(argv, server.password or "", timeout)
 
 
+_remote_sudo_cache: Dict[str, bool] = {}
+
+
+def _server_cache_key(server: core.Server) -> str:
+    return f"{server.user}@{server.host}:{server.port}"
+
+
+def remote_has_sudo(server: core.Server) -> bool:
+    """True when remote `sudo` binary exists (cached per host)."""
+    key = _server_cache_key(server)
+    if key in _remote_sudo_cache:
+        return _remote_sudo_cache[key]
+    code, _out = ssh_remote_capture(
+        server, "command -v sudo >/dev/null 2>&1", timeout=20.0
+    )
+    _remote_sudo_cache[key] = code == 0
+    return _remote_sudo_cache[key]
+
+
+def _mark_sudo_missing(server: core.Server) -> None:
+    _remote_sudo_cache[_server_cache_key(server)] = False
+
+
+def _sudo_missing_output(out: str) -> bool:
+    low = (out or "").lower()
+    return (
+        "sudo: not found" in low
+        or "sudo: command not found" in low
+        or ("command not found" in low and "sudo" in low)
+    )
+
+
 def _can_sudo(server: core.Server) -> bool:
-    """sudo -S needs the YAML host password."""
-    return bool(server.password)
+    """sudo -S needs YAML password and a remote sudo binary."""
+    return bool(server.password) and remote_has_sudo(server)
 
 
 def wrap_sudo(remote_cmd: str, password: str) -> str:
@@ -254,6 +286,11 @@ def _looks_like_privilege_failure(code: int, out: str = "") -> bool:
     if code == 0:
         return False
     low = (out or "").lower()
+    if _sudo_missing_output(out):
+        return False
+    # Missing binaries (php/drush) are not privilege errors
+    if "command not found" in low or "no such file" in low:
+        return False
     needles = (
         "permission denied",
         "operation not permitted",
@@ -262,12 +299,9 @@ def _looks_like_privilege_failure(code: int, out: str = "") -> bool:
         "must be root",
         "password is required",
         "a password is required",
-        "sudo:",
+        "sudo: ",
     )
-    if any(n in low for n in needles):
-        return True
-    # Common non-zero exits when the user cannot read/traverse the path
-    return code in (1, 126, 127)
+    return any(n in low for n in needles)
 
 
 def ssh_remote_capture_sudo_fallback(
@@ -278,9 +312,9 @@ def ssh_remote_capture_sudo_fallback(
     always_retry: bool = False,
 ) -> Tuple[int, str, bool]:
     """
-    Try remote_cmd without sudo; on failure retry with sudo -S when YAML
-    password is present (privilege-like errors, or always_retry=True for detect).
-    Returns (code, output, used_sudo).
+    Try remote_cmd without sudo; on failure retry with sudo -S when available
+    (privilege-like errors, or always_retry=True for detect).
+    Returns (code, output, used_sudo). Skips sudo when binary is missing.
     """
     code, out = ssh_remote_capture(server, remote_cmd, timeout=timeout)
     if code == 0:
@@ -292,6 +326,12 @@ def ssh_remote_capture_sudo_fallback(
     assert server.password is not None
     sudo_cmd = wrap_sudo(remote_cmd, server.password)
     code2, out2 = ssh_remote_capture(server, sudo_cmd, timeout=timeout)
+    if _sudo_missing_output(out2) or (
+        code2 == 127 and "sudo" in (out2 or "").lower()
+    ):
+        _mark_sudo_missing(server)
+        # Keep the original non-sudo failure as the useful result
+        return code, out, False
     return code2, out2, True
 
 
@@ -301,7 +341,7 @@ def ssh_remote_sudo_fallback(
     interactive: bool = True,
 ) -> Tuple[int, bool]:
     """
-    Run remote_cmd; if it fails and YAML password exists, retry with sudo -S.
+    Run remote_cmd; if it fails and sudo is available, retry with sudo -S.
     Returns (exit_code, used_sudo).
     """
     code = ssh_remote(server, remote_cmd, interactive=interactive)
@@ -516,44 +556,90 @@ def remi_shell_cmd(
     quiet: bool = False,
 ) -> str:
     """
-    Source Remi enable then run shell_after_cd (already `cd`'d into path_q).
-    preferred=php83 → that path only; else first existing php81→php84.
+    Activate Remi PHP as the SSH user (no sudo), then run shell_after_cd.
+    Tries: source enable → scl enable → module → direct
+    /opt/remi/php8x/root/usr/bin/php on PATH.
+    preferred=php83 → that version only; else first existing php81→php84.
     """
-    announce = "" if quiet else 'echo "Using Remi: source $enable" >&2'
-    if preferred and _REMI_PHP_RE.match(preferred):
-        enable_q = shlex.quote(remi_enable_for(preferred))
-        return f"""
-set -e
-cd {path_q}
-enable={enable_q}
-if [ ! -f "$enable" ]; then
-  echo "Cached Remi enable missing: $enable" >&2
-  exit 127
-fi
-{announce}
-# shellcheck disable=SC1090
-source "$enable"
-{shell_after_cd}
-"""
     checks = " ".join(shlex.quote(p) for p in REMI_PHP_ENABLE_CANDIDATES)
+    preferred_q = shlex.quote(preferred) if preferred and _REMI_PHP_RE.match(preferred) else "''"
+    quiet_flag = "1" if quiet else "0"
+    # shell_after_cd is embedded as a quoted script for scl/module subshells
+    body_q = shlex.quote(shell_after_cd)
     return f"""
 set -e
 cd {path_q}
-enable=
-for f in {checks}; do
-  if [ -f "$f" ]; then
-    enable=$f
-    break
+QUIET={quiet_flag}
+PREFERRED={preferred_q}
+announce() {{
+  if [ "$QUIET" = "0" ]; then
+    echo "Using Remi: $*" >&2
   fi
-done
-if [ -z "$enable" ]; then
-  echo "No Remi PHP enable found (tried php81–php84 under /opt/remi/)." >&2
+}}
+run_body() {{
+  eval {body_q}
+}}
+pick_label() {{
+  if [ -n "$PREFERRED" ] && [ -d "/opt/remi/$PREFERRED" ]; then
+    echo "$PREFERRED"
+    return 0
+  fi
+  for f in {checks}; do
+    if [ -f "$f" ] || [ -x "$(dirname "$f")/root/usr/bin/php" ]; then
+      basename "$(dirname "$f")"
+      return 0
+    fi
+  done
+  return 1
+}}
+label=$(pick_label) || {{
+  echo "No Remi PHP found (tried php81–php84 under /opt/remi/)." >&2
   exit 127
+}}
+enable="/opt/remi/$label/enable"
+php_bin="/opt/remi/$label/root/usr/bin/php"
+# 1) source enable script (user-level)
+if [ -f "$enable" ]; then
+  announce "source $enable"
+  set +e
+  # shellcheck disable=SC1090
+  source "$enable"
+  src_rc=$?
+  set -e
+  if [ "$src_rc" -eq 0 ]; then
+    run_body
+    exit $?
+  fi
+  echo "Remi source failed (exit $src_rc); trying other methods…" >&2
 fi
-{announce}
-# shellcheck disable=SC1090
-source "$enable"
-{shell_after_cd}
+# 2) scl enable
+if command -v scl >/dev/null 2>&1; then
+  announce "scl enable $label"
+  if scl enable "$label" -- bash -lc {body_q}; then
+    exit 0
+  fi
+fi
+# 3) environment module
+if command -v module >/dev/null 2>&1; then
+  announce "module load $label"
+  set +e
+  module load "$label" >/dev/null 2>&1
+  mod_rc=$?
+  set -e
+  if [ "$mod_rc" -eq 0 ]; then
+    run_body
+    exit $?
+  fi
+fi
+# 4) direct Remi php binary on PATH (vendor/bin/drush shebang uses env php)
+if [ -x "$php_bin" ]; then
+  announce "direct $php_bin"
+  export PATH="$(dirname "$php_bin"):$PATH"
+  run_body
+  exit $?
+fi
+echo "Remi $label found but could not activate (source/scl/module/direct php)." >&2
+exit 127
 """
 
 
@@ -829,74 +915,95 @@ def _exec_vendor_shell(
     timeout: float = 600.0,
 ) -> Tuple[core.Server, int, str, bool]:
     """
-    Run shell_after_cd in web_remote: plain → sudo → Remi (+ sudo).
+    Run shell_after_cd in web_remote.
+
+    Chain (sudo skipped when missing):
+      cached Remi (user) → plain → Remi probe (user: source/scl/module/direct php)
+      → same steps with sudo -S only if sudo exists + YAML password.
+
     Returns (server, code, output, used_remi).
     """
     path_q = shlex.quote(path)
     plain_cmd = f"cd {path_q} && {shell_after_cd}"
     cached = server.remi_php if (server.remi_php and _REMI_PHP_RE.match(server.remi_php)) else None
-    used_sudo = False
     used_remi = False
     remi_enable_used = ""
     out = ""
     code = 1
 
+    def _run(cmd: str, *, try_sudo: bool) -> Tuple[int, str]:
+        if try_sudo:
+            c, o, _s = ssh_remote_capture_sudo_fallback(
+                server, cmd, timeout=timeout, always_retry=True
+            )
+            return c, o
+        return ssh_remote_capture(server, cmd, timeout=timeout)
+
+    def _try_remi(*, preferred: Optional[str], quiet: bool, try_sudo: bool) -> Tuple[int, str]:
+        cmd = remi_shell_cmd(
+            path_q, shell_after_cd, preferred=preferred, quiet=quiet
+        )
+        return _run(cmd, try_sudo=try_sudo)
+
+    # Pass 1: user-level only (no sudo)
     if cached:
-        remi_cmd = remi_shell_cmd(
-            path_q, shell_after_cd, preferred=cached, quiet=True
-        )
-        code, out, used_sudo = ssh_remote_capture_sudo_fallback(
-            server, remi_cmd, timeout=timeout, always_retry=True
-        )
+        code, out = _try_remi(preferred=cached, quiet=True, try_sudo=False)
         used_remi = True
         remi_enable_used = remi_enable_for(cached)
         if code != 0:
             _print_red_block(
                 [
                     f"Cached Remi {cached} failed (exit {code}).",
-                    "Retrying: plain → Remi php81–84 probe…",
+                    "Retrying: plain → Remi php81–84 (user, no sudo)…",
                 ]
             )
-            code, out1, used_sudo1 = ssh_remote_capture_sudo_fallback(
-                server, plain_cmd, timeout=timeout, always_retry=True
-            )
-            used_sudo = used_sudo or used_sudo1
-            if code != 0:
-                fail_lines = [ln for ln in (out1 or "").splitlines() if ln.strip()]
-                fail_lines.append(
-                    "retrying with first existing Remi enable (php81–php84) …"
-                )
-                _print_red_block(fail_lines)
-                remi_cmd = remi_shell_cmd(path_q, shell_after_cd, quiet=False)
-                code, out, used_sudo2 = ssh_remote_capture_sudo_fallback(
-                    server, remi_cmd, timeout=timeout, always_retry=True
-                )
-                used_sudo = used_sudo or used_sudo2
-                used_remi = True
-                remi_enable_used = _parse_remi_enable_used(out) or remi_enable_used
-            else:
+            code, out1 = _run(plain_cmd, try_sudo=False)
+            if code == 0:
                 out = out1
                 used_remi = False
                 remi_enable_used = ""
+            else:
+                fail_lines = [ln for ln in (out1 or "").splitlines() if ln.strip()]
+                fail_lines.append(
+                    "retrying Remi php81–84 (source / scl / module / direct php)…"
+                )
+                _print_red_block(fail_lines)
+                code, out = _try_remi(preferred=None, quiet=False, try_sudo=False)
+                used_remi = True
+                remi_enable_used = _parse_remi_enable_used(out) or remi_enable_used
     else:
-        code, out1, used_sudo = ssh_remote_capture_sudo_fallback(
-            server, plain_cmd, timeout=timeout, always_retry=True
-        )
-        if code != 0:
+        code, out1 = _run(plain_cmd, try_sudo=False)
+        if code == 0:
+            out = out1
+        else:
             fail_lines = [ln for ln in (out1 or "").splitlines() if ln.strip()]
             fail_lines.append(
-                "retrying with first existing Remi enable (php81–php84) …"
+                "retrying Remi php81–84 (source / scl / module / direct php)…"
             )
             _print_red_block(fail_lines)
-            remi_cmd = remi_shell_cmd(path_q, shell_after_cd, quiet=False)
-            code, out, used_sudo2 = ssh_remote_capture_sudo_fallback(
-                server, remi_cmd, timeout=timeout, always_retry=True
-            )
-            used_sudo = used_sudo or used_sudo2
+            code, out = _try_remi(preferred=None, quiet=False, try_sudo=False)
             used_remi = True
             remi_enable_used = _parse_remi_enable_used(out)
-        else:
-            out = out1
+
+    # Pass 2: sudo only when still failing and sudo is actually available
+    if code != 0 and _can_sudo(server):
+        _print_red_block(
+            ["User-level attempts failed; retrying with sudo -S …"]
+        )
+        if cached:
+            code, out = _try_remi(preferred=cached, quiet=True, try_sudo=True)
+            used_remi = True
+            remi_enable_used = remi_enable_for(cached)
+        if code != 0:
+            code, out1 = _run(plain_cmd, try_sudo=True)
+            if code == 0:
+                out = out1
+                used_remi = False
+                remi_enable_used = ""
+            else:
+                code, out = _try_remi(preferred=None, quiet=False, try_sudo=True)
+                used_remi = True
+                remi_enable_used = _parse_remi_enable_used(out) or remi_enable_used
 
     if code == 0 and used_remi and remi_enable_used:
         label = remi_php_label(remi_enable_used)
@@ -948,10 +1055,23 @@ def _print_drush_output_line(line: str, *, quiet: bool = False) -> None:
 
 
 def _parse_remi_enable_used(out: str) -> str:
+    """Return enable path or empty; also accepts scl/direct announce lines."""
     for line in (out or "").splitlines():
         m = _REMI_USING_RE.search(line)
         if m:
-            return m.group(1).strip()
+            token = m.group(1).strip()
+            if token.startswith("/opt/remi/") and token.endswith("/enable"):
+                return token
+            # "direct /opt/remi/php83/root/usr/bin/php"
+            m_php = re.search(r"/opt/remi/(php8[1-4])/", token)
+            if m_php:
+                return remi_enable_for(m_php.group(1))
+        # "Using Remi: scl enable php83" / "module load php83" / "source /opt/..."
+        m_lab = re.search(
+            r"Using Remi:.*\b(php8[1-4])\b", line, re.IGNORECASE
+        )
+        if m_lab:
+            return remi_enable_for(m_lab.group(1).lower())
         for cand in REMI_PHP_ENABLE_CANDIDATES:
             if cand in line and "Using Remi" in line:
                 return cand
@@ -988,20 +1108,23 @@ def action_drush(
     drush_args: str,
     config_path: Optional[Path] = None,
 ) -> core.Server:
-    """Run vendor/bin/drush <args> in web_remote (sudo + Remi PHP retries)."""
+    """Run vendor/bin/drush <args> in web_remote (Remi user-level, sudo only if present)."""
     if not server.web_remote:
         return server
     path = normalize_remote_path(server.web_remote)
-    path_q = shlex.quote(path)
-    plain_cmd = f"cd {path_q} && vendor/bin/drush {drush_args}"
     cached = server.remi_php if (server.remi_php and _REMI_PHP_RE.match(server.remi_php)) else None
     quiet = bool(cached)
+    has_sudo = _can_sudo(server)
 
-    note = (
-        f"note:  Remi {cached} (cached) → sudo fallback"
-        if cached
-        else "note:  plain → sudo → Remi php81–84 enable (+ sudo)"
-    )
+    if cached:
+        note = f"note:  Remi {cached} (cached) → plain → Remi probe"
+    else:
+        note = "note:  plain → Remi php81–84 (source/scl/module/direct php)"
+    if has_sudo:
+        note += " → sudo -S last"
+    else:
+        note += " · no sudo on host (skipped)"
+
     _print_info_panel(
         title,
         [
@@ -1016,71 +1139,14 @@ def action_drush(
         return server
     print()  # blank after first Press Enter
 
-    used_sudo = False
-    used_remi = False
-    remi_enable_used = ""
-    out = ""
-    code = 1
-
     try:
-        if cached:
-            remi_cmd = remi_drush_cmd(
-                path_q, drush_args, preferred=cached, quiet=True
-            )
-            code, out, used_sudo = ssh_remote_capture_sudo_fallback(
-                server, remi_cmd, timeout=180.0, always_retry=True
-            )
-            used_remi = True
-            remi_enable_used = remi_enable_for(cached)
-            if code != 0:
-                # Cached path failed — fall through to discovery (verbose).
-                quiet = False
-                _print_red_block(
-                    [
-                        f"Cached Remi {cached} failed (exit {code}).",
-                        "Retrying: plain → Remi php81–84 probe…",
-                    ]
-                )
-                code, out1, used_sudo1 = ssh_remote_capture_sudo_fallback(
-                    server, plain_cmd, timeout=180.0, always_retry=True
-                )
-                used_sudo = used_sudo or used_sudo1
-                if code != 0:
-                    fail_lines = [ln for ln in (out1 or "").splitlines() if ln.strip()]
-                    fail_lines.append(
-                        "retrying with first existing Remi enable (php81–php84) …"
-                    )
-                    _print_red_block(fail_lines)
-                    remi_cmd = remi_drush_cmd(path_q, drush_args, quiet=False)
-                    code, out, used_sudo2 = ssh_remote_capture_sudo_fallback(
-                        server, remi_cmd, timeout=180.0, always_retry=True
-                    )
-                    used_sudo = used_sudo or used_sudo2
-                    used_remi = True
-                    remi_enable_used = _parse_remi_enable_used(out) or remi_enable_used
-                else:
-                    out = out1
-                    used_remi = False
-                    remi_enable_used = ""
-        else:
-            code, out1, used_sudo = ssh_remote_capture_sudo_fallback(
-                server, plain_cmd, timeout=180.0, always_retry=True
-            )
-            if code != 0:
-                fail_lines = [ln for ln in (out1 or "").splitlines() if ln.strip()]
-                fail_lines.append(
-                    "retrying with first existing Remi enable (php81–php84) …"
-                )
-                _print_red_block(fail_lines)
-                remi_cmd = remi_drush_cmd(path_q, drush_args, quiet=False)
-                code, out, used_sudo2 = ssh_remote_capture_sudo_fallback(
-                    server, remi_cmd, timeout=180.0, always_retry=True
-                )
-                used_sudo = used_sudo or used_sudo2
-                used_remi = True
-                remi_enable_used = _parse_remi_enable_used(out)
-            else:
-                out = out1
+        server, code, out, used_remi = _exec_vendor_shell(
+            server,
+            path,
+            f"vendor/bin/drush {drush_args}",
+            config_path=config_path,
+            timeout=180.0,
+        )
     except KeyboardInterrupt:
         print(f"\n{_CANCEL_HINT}")
         return server
@@ -1092,33 +1158,23 @@ def action_drush(
         else:
             for line in (out or "").splitlines():
                 _print_drush_output_line(line, quiet=False)
-            # Ensure a styled success line exists
             if not any(_DRUSH_SUCCESS_RE.search(ln) for ln in (out or "").splitlines()):
                 _print_success_line(f"[success] {title} finished.")
-        if used_remi and remi_enable_used:
-            label = remi_php_label(remi_enable_used)
-            if label:
-                server = _persist_remi_php(config_path, server, label)
         print()  # blank before final Press Enter
         _pause()
         return server
 
-    # Failure
     for line in (out or "").splitlines():
         _print_drush_output_line(line, quiet=False)
-    last_cmd = (
-        f"cd {path} && source {remi_enable_used or '<remi>'} && vendor/bin/drush {drush_args}"
-        if used_remi
-        else plain_cmd
-    )
     _print_error_panel(
         f"{title} failed",
         [
             f"host: {server.label}",
             f"path: {path}",
             f"exit: {code}",
-            f"cmd:  {last_cmd}",
-            "Tried: plain → sudo → Remi php81–84 (+ sudo).",
+            f"cmd:  vendor/bin/drush {drush_args}",
+            "Tried: plain → Remi (source/scl/module/direct php)"
+            + (" → sudo -S" if has_sudo else " (sudo skipped — not installed)"),
             "Copy the output below for debugging.",
         ],
         out,
@@ -1410,15 +1466,47 @@ def pick_remote_dump_file(
                 return path
 
 
-def _prompt_mysql_creds_manual() -> Optional[Dict[str, str]]:
-    """Interactive MySQL connection (password not saved)."""
-    print("MySQL credentials (not saved to YAML):")
+def _mysql_creds_from_server(server: core.Server) -> Optional[Dict[str, str]]:
+    """Build runtime creds from YAML fields when user+db are set."""
+    if not server.mysql_user or not server.mysql_db:
+        return None
+    return {
+        "host": (server.mysql_host or "127.0.0.1").strip() or "127.0.0.1",
+        "port": "3306",
+        "username": server.mysql_user,
+        "database": server.mysql_db,
+        "password": server.mysql_pass or "",
+    }
+
+
+def _prompt_mysql_creds_manual(
+    defaults: Optional[Dict[str, str]] = None,
+) -> Optional[Dict[str, str]]:
+    """Interactive MySQL connection. Prefills from defaults/YAML when present."""
+    d = defaults or {}
+    def_host = (d.get("host") or "127.0.0.1").strip() or "127.0.0.1"
+    def_port = (d.get("port") or "3306").strip() or "3306"
+    def_user = (d.get("username") or "").strip()
+    def_db = (d.get("database") or "").strip()
+    has_pass = bool(d.get("password"))
+
+    print("MySQL credentials:")
+    print(_c(_ANSI_CYAN_DIM, "  (prefer Vendor/Drush when available; save to YAML only if you choose)"))
     try:
-        host = input("  host [127.0.0.1]: ").strip() or "127.0.0.1"
-        port = input("  port [3306]: ").strip() or "3306"
-        user = input("  user: ").strip()
-        database = input("  database: ").strip()
-        password = getpass.getpass("  password: ")
+        host_in = input(f"  host [{def_host}]: ").strip()
+        host = host_in or def_host
+        port_in = input(f"  port [{def_port}]: ").strip()
+        port = port_in or def_port
+        user_hint = f" [{def_user}]" if def_user else ""
+        user = input(f"  user{user_hint}: ").strip() or def_user
+        db_hint = f" [{def_db}]" if def_db else ""
+        database = input(f"  database{db_hint}: ").strip() or def_db
+        if has_pass:
+            password = getpass.getpass("  password [saved — Enter to keep]: ")
+            if not password:
+                password = d.get("password") or ""
+        else:
+            password = getpass.getpass("  password: ")
     except (EOFError, KeyboardInterrupt):
         print(f"\n{_CANCEL_HINT}")
         return None
@@ -1432,6 +1520,54 @@ def _prompt_mysql_creds_manual() -> Optional[Dict[str, str]]:
         "database": database,
         "password": password,
     }
+
+
+def _mysql_creds_match_server(server: core.Server, creds: Dict[str, str]) -> bool:
+    saved = _mysql_creds_from_server(server)
+    if not saved:
+        return False
+    return (
+        saved["host"] == (creds.get("host") or "127.0.0.1")
+        and saved["username"] == creds.get("username")
+        and saved["database"] == creds.get("database")
+        and (saved.get("password") or "") == (creds.get("password") or "")
+    )
+
+
+def _maybe_persist_mysql_creds(
+    server: core.Server,
+    creds: Dict[str, str],
+    config_path: Optional[Path],
+) -> core.Server:
+    """After successful MySQL auth, offer y/N to save into servers.yaml."""
+    if not config_path:
+        return server
+    if _mysql_creds_match_server(server, creds):
+        return server
+    print()
+    print(
+        _c(
+            _ANSI_YELLOW,
+            "Save MySQL creds to servers.yaml? (plaintext — prefer keys/Drush when you can)",
+        )
+    )
+    if not _confirm_yn("Save mysql_host / mysql_db / mysql_user / mysql_pass?", default_yes=False):
+        return server
+    updated = replace(
+        server,
+        mysql_host=(creds.get("host") or None),
+        mysql_db=(creds.get("database") or None),
+        mysql_user=(creds.get("username") or None),
+        mysql_pass=(creds.get("password") or None),
+    )
+    try:
+        core.update_server(config_path, server.name, updated)
+    except Exception as exc:  # noqa: BLE001
+        print(_c(_ANSI_RED, f"  Could not save MySQL creds: {exc}"))
+        return server
+    _print_success_line("[success] MySQL creds saved to servers.yaml")
+    print()
+    return updated
 
 
 def _parse_drush_sql_conf(out: str) -> Optional[Dict[str, str]]:
@@ -1477,8 +1613,10 @@ def resolve_mysql_creds(
 ) -> Tuple[core.Server, Optional[Dict[str, str]]]:
     """
     Resolve DB creds for mysqldump/mysql.
-    Prefer drush sql:conf when vendor exists; else prompt (never write password to YAML).
+    Prefer Drush (no plaintext) → YAML saved → interactive prompt (prefilled).
     """
+    saved = _mysql_creds_from_server(server)
+
     if has_vendor and server.web_remote:
         path = normalize_remote_path(server.web_remote)
         server, code, out, _remi = _exec_vendor_shell(
@@ -1491,9 +1629,29 @@ def resolve_mysql_creds(
         if code == 0:
             creds = _parse_drush_sql_conf(out)
             if creds and creds.get("password") is not None and creds.get("database"):
+                print(_c(_ANSI_CYAN_DIM, "  creds: Drush sql:conf"))
                 return server, creds
-        print(_c(_ANSI_YELLOW, "Could not read DB password via Drush — enter manually."))
-    return server, _prompt_mysql_creds_manual()
+        print(_c(_ANSI_YELLOW, "Could not read DB password via Drush — trying YAML / prompt."))
+
+    if saved and saved.get("username") and saved.get("database"):
+        print(
+            _c(
+                _ANSI_CYAN_DIM,
+                f"  creds: YAML ({saved['username']}@{saved['host']}/{saved['database']})",
+            )
+        )
+        return server, saved
+
+    defaults = saved or {}
+    if server.mysql_host and "host" not in defaults:
+        defaults = {**defaults, "host": server.mysql_host}
+    if server.mysql_user and "username" not in defaults:
+        defaults = {**defaults, "username": server.mysql_user}
+    if server.mysql_db and "database" not in defaults:
+        defaults = {**defaults, "database": server.mysql_db}
+    if server.mysql_pass and "password" not in defaults:
+        defaults = {**defaults, "password": server.mysql_pass}
+    return server, _prompt_mysql_creds_manual(defaults or None)
 
 
 def _mysql_defaults_file_remote_script(creds: Dict[str, str], conf_path: str) -> str:
@@ -1735,7 +1893,7 @@ def action_db_export_mysql(
             f"dump:    {remote_dump}",
             f"local:   {local_path}",
             "cmd:     mysqldump --single-transaction --quick --lock-tables=false | gzip",
-            "creds:   Drush sql:conf if Vendor, else prompt (not saved)",
+            "creds:   Drush → YAML → prompt (optional save after success)",
             "confirm: y to run · Enter/N cancels",
         ],
     )
@@ -1813,6 +1971,7 @@ rm -f {conf_q}
         return server
 
     _print_success_line(f"[success] Exported → {local_path}")
+    server = _maybe_persist_mysql_creds(server, creds, config_path)
     print()
     _pause()
     return server
@@ -1931,6 +2090,7 @@ rm -f {conf_q} {remote_q}
         return server
 
     _print_success_line("[success] MySQL import finished.")
+    server = _maybe_persist_mysql_creds(server, creds, config_path)
     print()
     _pause()
     return server

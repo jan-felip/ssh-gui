@@ -87,6 +87,11 @@ class Server:
     git_user: Optional[str] = None
     git_token: Optional[str] = None
     remi_php: Optional[str] = None  # e.g. php83 — cached Remi enable from Vendor Drush
+    # MySQL (optional plaintext — prefer Drush/Vendor when possible; user may save after prompt)
+    mysql_host: Optional[str] = None
+    mysql_db: Optional[str] = None
+    mysql_user: Optional[str] = None
+    mysql_pass: Optional[str] = None
 
     @property
     def label(self) -> str:
@@ -115,6 +120,14 @@ class Server:
             data["git_token"] = self.git_token
         if self.remi_php:
             data["remi_php"] = self.remi_php
+        if self.mysql_host:
+            data["mysql_host"] = self.mysql_host
+        if self.mysql_db:
+            data["mysql_db"] = self.mysql_db
+        if self.mysql_user:
+            data["mysql_user"] = self.mysql_user
+        if self.mysql_pass:
+            data["mysql_pass"] = self.mysql_pass
         return data
 
 
@@ -163,13 +176,21 @@ def parse_servers(raw: Dict[str, Any]) -> List[Server]:
                 git_user=(str(data["git_user"]) if data.get("git_user") else None),
                 git_token=(str(data["git_token"]) if data.get("git_token") else None),
                 remi_php=(str(data["remi_php"]) if data.get("remi_php") else None),
+                mysql_host=(str(data["mysql_host"]) if data.get("mysql_host") else None),
+                mysql_db=(str(data["mysql_db"]) if data.get("mysql_db") else None),
+                mysql_user=(str(data["mysql_user"]) if data.get("mysql_user") else None),
+                mysql_pass=(str(data["mysql_pass"]) if data.get("mysql_pass") else None),
             )
         )
     return servers
 
 
 def load_servers(config_path: Path) -> List[Server]:
-    return parse_servers(load_raw(config_path))
+    """Load hosts sorted alphabetically by name (case-insensitive)."""
+    return sorted(
+        parse_servers(load_raw(config_path)),
+        key=lambda s: s.name.casefold(),
+    )
 
 
 def _read_raw_map(config_path: Path) -> Dict[str, Any]:
@@ -736,6 +757,7 @@ def _draw_add_label(stdscr: "curses._CursesWindow", y: int, w: int, selected: bo
 
 # Form field keys / labels. required → red asterisk while empty. secret → mask value.
 FORM_FIELDS: List[Tuple[str, str, bool, bool]] = [
+    # SSH
     ("name", "Name", True, False),
     ("host", "Host", True, False),
     ("user", "User", True, False),
@@ -743,12 +765,27 @@ FORM_FIELDS: List[Tuple[str, str, bool, bool]] = [
     ("password", "Password", False, True),
     ("identity", "Identity", False, False),
     ("notes", "Notes", False, False),
+    # Paths
     ("web_remote", "Web remote", False, False),
     ("web_local", "Web local", False, False),
+    # Git
     ("git_user", "Git user", False, False),
     ("git_token", "Git token", False, True),
+    # MySQL (optional plaintext; prefer Vendor/Drush when possible)
+    ("mysql_host", "DB host", False, False),
+    ("mysql_db", "DB name", False, False),
+    ("mysql_user", "DB user", False, False),
+    ("mysql_pass", "DB pass", False, True),
 ]
+# Section header drawn immediately before this field index (gray group label).
+FORM_SECTION_AT: Dict[int, str] = {
+    0: "SSH",
+    7: "Paths",
+    9: "Git",
+    11: "MySQL",
+}
 FORM_LABEL_W = 12
+FORM_SECRET_KEYS = frozenset({"password", "git_token", "mysql_pass"})
 ACTION_REMOVE = "remove"
 ACTION_DISCARD = "discard"
 ACTION_SAVE = "save"
@@ -779,7 +816,7 @@ def _confirm_dialog(stdscr: "curses._CursesWindow", message: str) -> bool:
 
 def _commit_field_buf(values: Dict[str, str], key: str, buf: List[str]) -> None:
     text = "".join(buf)
-    values[key] = text if key == "password" else text.strip()
+    values[key] = text if key in FORM_SECRET_KEYS else text.strip()
 
 
 def _build_server_from_values(
@@ -800,6 +837,10 @@ def _build_server_from_values(
     web_local = values.get("web_local", "").strip()
     git_user = values.get("git_user", "").strip()
     git_token = values.get("git_token", "")
+    mysql_host = values.get("mysql_host", "").strip()
+    mysql_db = values.get("mysql_db", "").strip()
+    mysql_user = values.get("mysql_user", "").strip()
+    mysql_pass = values.get("mysql_pass", "")
 
     if not name:
         return None, "Name is required."
@@ -830,6 +871,10 @@ def _build_server_from_values(
             git_user=git_user or None,
             git_token=git_token or None,
             remi_php=remi_php or None,
+            mysql_host=mysql_host or None,
+            mysql_db=mysql_db or None,
+            mysql_user=mysql_user or None,
+            mysql_pass=mysql_pass or None,
         ),
         None,
     )
@@ -859,6 +904,10 @@ def host_form(
             "web_local": _identity_display(initial.web_local),
             "git_user": initial.git_user or "",
             "git_token": initial.git_token or "",
+            "mysql_host": initial.mysql_host or "",
+            "mysql_db": initial.mysql_db or "",
+            "mysql_user": initial.mysql_user or "",
+            "mysql_pass": initial.mysql_pass or "",
         }
         blocked_names = set(existing_names) - {initial.name}
         original_name = initial.name
@@ -910,14 +959,28 @@ def host_form(
         _safe_add(stdscr, 1, 0, hint, curses.color_pair(2))
 
         label_w = FORM_LABEL_W
-        value_x = 2 + label_w + 3  # "  LABEL  " + gap before value
-        mark_x = 2 + label_w
+        # Section headers at x=2; field rows indented +2 like → actions items
+        field_x = 4
+        value_x = field_x + label_w + 3  # "    LABEL  " + gap before value
+        mark_x = field_x + label_w
 
         field_top = 3
         cursor_y = field_top
         cursor_x = value_x
+        y = field_top
         for i, (key, label, required, secret) in enumerate(FORM_FIELDS):
-            y = field_top + i
+            section = FORM_SECTION_AT.get(i)
+            if section:
+                if y >= h - 1:
+                    break
+                _safe_add(
+                    stdscr,
+                    y,
+                    2,
+                    section,
+                    curses.color_pair(8) | curses.A_BOLD,
+                )
+                y += 1
             if y >= h - 1:
                 break
             selected = idx == i
@@ -942,7 +1005,7 @@ def host_form(
                 val_attr = curses.color_pair(4)
                 star_attr = curses.color_pair(7) | curses.A_BOLD
 
-            _safe_add(stdscr, y, 2, _fit_cell(label, label_w), lab_attr)
+            _safe_add(stdscr, y, field_x, _fit_cell(label, label_w), lab_attr)
             needs_star = required and not raw_val.strip()
             if needs_star:
                 _safe_add(stdscr, y, mark_x, "*", star_attr)
@@ -958,9 +1021,10 @@ def host_form(
                 cursor_x = value_x + min(pos - view_start, avail - 1)
             else:
                 _safe_add(stdscr, y, value_x, display_val[:avail], val_attr)
+            y += 1
 
         # Blank line, then actions
-        action_top = field_top + n_fields + 1
+        action_top = y + 1
         for a_i, action in enumerate(actions):
             y = action_top + a_i
             item_i = n_fields + a_i

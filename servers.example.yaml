@@ -17,9 +17,13 @@
 #   git_user    (optional) username for private HTTPS git pull on remote
 #   git_token   (optional) token/password for git — NEVER commit real tokens
 #   remi_php    (optional) cached Remi version from Vendor Drush, e.g. php83
+#   mysql_host  (optional) MySQL host for raw dump/import (default 127.0.0.1)
+#   mysql_db    (optional) MySQL database name
+#   mysql_user  (optional) MySQL username
+#   mysql_pass  (optional) MySQL password — plaintext; prefer Vendor/Drush when possible
 #
 # DB dumps (Vendor/MySQL Export) land in <web_local>/db-dumps/*.sql.gz
-# Never commit dumps or DB passwords. MySQL Import prompts if Drush can't read creds.
+# Never commit dumps or real mysql_pass / git_token values.
 
 example_lab:
   host: 192.0.2.10
