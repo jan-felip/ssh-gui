@@ -15,7 +15,7 @@ import urllib.parse
 from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterator, List, Optional, TextIO, Tuple
 
 import ssh_gui as core
 
@@ -591,6 +591,223 @@ def _is_dump_filename(name: str) -> bool:
     return bool(_DUMP_NAME_RE.match(name))
 
 
+_RSYNC_PROGRESS_RE = re.compile(
+    r"^\s*([\d,]+)\s+(\d+)%\s+(\S+)\s+([\d:]+)(?:\s+\((.+)\))?\s*$"
+)
+_RSYNC_PROGRESS2_RE = re.compile(
+    r"^\s*([\d,]+)\s+(\d+)%\s+(\S+)\s+([\d:]+)\s*$"
+)
+_RSYNC_TO_CHECK_RE = re.compile(r"to-check=(\d+)/(\d+)")
+
+_rsync_progress2_cached: Optional[bool] = None
+
+
+def _rsync_supports_progress2() -> bool:
+    global _rsync_progress2_cached
+    if _rsync_progress2_cached is not None:
+        return _rsync_progress2_cached
+    try:
+        proc = subprocess.run(
+            ["rsync", "--help"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        text = (proc.stdout or "") + (proc.stderr or "")
+        _rsync_progress2_cached = "progress2" in text
+    except (OSError, subprocess.TimeoutExpired):
+        _rsync_progress2_cached = False
+    return _rsync_progress2_cached
+
+
+def _progress_bar(pct: int, width: int = 26) -> str:
+    pct = max(0, min(100, int(pct)))
+    filled = int(round(width * pct / 100))
+    return "█" * filled + "░" * (width - filled)
+
+
+def _rsync_progress_flags() -> List[str]:
+    """Prefer overall progress2 on GNU rsync; classic --progress on openrsync."""
+    if _rsync_supports_progress2():
+        return ["--info=progress2", "--human-readable"]
+    return ["--progress", "-h"]
+
+
+def _colorize_rsync_name_line(line: str) -> str:
+    s = line.rstrip("\n")
+    stripped = s.lstrip()
+    low = stripped.lower()
+    if not stripped:
+        return s
+    if stripped.startswith("sending ") or stripped.startswith("receiving "):
+        return _c(_ANSI_CYAN_DIM, s)
+    if stripped.startswith("sent ") or stripped.startswith("total size"):
+        return _c(_ANSI_CYAN, s)
+    if "speedup" in low:
+        return _c(_ANSI_CYAN, s)
+    if stripped.startswith("deleting ") or low.startswith("*deleting"):
+        return _c(_ANSI_RED, s)
+    if stripped.startswith(">f+++++++++") or stripped.startswith("<f+++++++++"):
+        return _c(_ANSI_GREEN, s)
+    if stripped.startswith(">f") or stripped.startswith("<f") or stripped.startswith("c"):
+        return _c(_ANSI_YELLOW, s)
+    if stripped.startswith("./") or stripped.endswith("/"):
+        return _c(_ANSI_CYAN_DIM, s)
+    return _c(_ANSI_GREEN, s)
+
+
+def _format_rsync_progress_line(
+    *,
+    name: str,
+    pct: int,
+    rate: str,
+    eta: str,
+    extra: str = "",
+) -> str:
+    bar = _progress_bar(pct)
+    name_w = 34
+    shown = name if len(name) <= name_w else ("…" + name[-(name_w - 1) :])
+    pct_s = f"{pct:3d}%"
+    rate_s = f"{rate:>9}"
+    eta_s = f"{eta:>8}"
+    tail = f"  {extra}" if extra else ""
+    body = f"  {shown:<{name_w}}  [{bar}]  {pct_s}  {rate_s}  {eta_s}{tail}"
+    return _c(_ANSI_CYAN, body)
+
+
+def _iter_rsync_output_chunks(stream: TextIO) -> Iterator[str]:
+    """Yield text chunks split on CR/LF (rsync progress rewrites with \\r)."""
+    buf = ""
+    while True:
+        block = stream.read(1024)
+        if not block:
+            if buf:
+                yield buf
+            break
+        buf += block
+        while True:
+            m = re.search(r"[\r\n]", buf)
+            if not m:
+                break
+            part, buf = buf[: m.start()], buf[m.end() :]
+            if part:
+                yield part
+
+
+def _rsync_is_meta_line(line: str) -> bool:
+    low = line.lstrip().lower()
+    return (
+        low.startswith("sending ")
+        or low.startswith("receiving ")
+        or low.startswith("sent ")
+        or low.startswith("total ")
+        or "speedup" in low
+        or low.startswith("building file list")
+        or low.startswith("created directory")
+    )
+
+
+def run_rsync_pretty(argv: List[str], server: core.Server) -> int:
+    """
+    Run rsync with colored file lines + aligned percent progress bar.
+    Password hosts keep PTY auto-auth (raw progress); key hosts get live polish.
+    """
+    if core.uses_yaml_password(server):
+        print(_c(_ANSI_CYAN_DIM, "  progress: live (PTY) — password host"))
+        return run_argv(argv, server, interactive=True)
+
+    print()
+    print(_c(_ANSI_CYAN, "-" * 56))
+    print(
+        _c(
+            _ANSI_CYAN_DIM,
+            "  path                               progress                   %     rate      eta",
+        )
+    )
+    print(_c(_ANSI_CYAN, "-" * 56))
+
+    current_name = ""
+    on_progress_row = False
+    try:
+        proc = subprocess.Popen(
+            argv,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=0,
+        )
+    except OSError as exc:
+        print(_c(_ANSI_RED, f"  failed to start rsync: {exc}"))
+        return 127
+
+    assert proc.stdout is not None
+    try:
+        for chunk in _iter_rsync_output_chunks(proc.stdout):
+            line = chunk.rstrip()
+            if not line.strip():
+                continue
+            m = _RSYNC_PROGRESS_RE.match(line) or _RSYNC_PROGRESS2_RE.match(line)
+            if m:
+                pct = int(m.group(2))
+                rate = m.group(3)
+                eta = m.group(4)
+                extra = ""
+                if m.lastindex and m.lastindex >= 5 and m.group(5):
+                    extra = m.group(5)
+                    tc = _RSYNC_TO_CHECK_RE.search(extra)
+                    if tc:
+                        done = int(tc.group(2)) - int(tc.group(1))
+                        total = int(tc.group(2))
+                        extra = f"{done}/{total}"
+                label = current_name or "transfer"
+                rendered = _format_rsync_progress_line(
+                    name=label, pct=pct, rate=rate, eta=eta, extra=extra
+                )
+                sys.stdout.write("\r\033[K" + rendered)
+                sys.stdout.flush()
+                on_progress_row = True
+                if pct >= 100:
+                    sys.stdout.write("\n")
+                    sys.stdout.flush()
+                    on_progress_row = False
+                    current_name = ""
+                continue
+
+            if on_progress_row:
+                sys.stdout.write("\n")
+                sys.stdout.flush()
+                on_progress_row = False
+            stripped = line.strip()
+            if not _rsync_is_meta_line(stripped):
+                current_name = stripped
+            print(_colorize_rsync_name_line(line))
+        code = proc.wait()
+    except KeyboardInterrupt:
+        try:
+            proc.terminate()
+        except OSError:
+            pass
+        try:
+            proc.wait(timeout=2)
+        except Exception:  # noqa: BLE001
+            try:
+                proc.kill()
+            except OSError:
+                pass
+        raise
+
+    if on_progress_row:
+        sys.stdout.write("\n")
+        sys.stdout.flush()
+    print(_c(_ANSI_CYAN, "-" * 56))
+    if code == 0:
+        _print_success_line("[success] rsync finished")
+    else:
+        print(_c(_ANSI_RED, f"  rsync exit: {code}"))
+    print()
+    return code
+
+
 def _rsync_file(
     server: core.Server,
     *,
@@ -599,8 +816,8 @@ def _rsync_file(
 ) -> int:
     """rsync a single file (src/dest may be local paths or user@host:path)."""
     ssh_e = "ssh " + " ".join(shlex.quote(o) for o in _ssh_opts(server))
-    argv = ["rsync", "-avz", "-e", ssh_e, src, dest]
-    return run_argv(argv, server, interactive=True)
+    argv = ["rsync", "-avz", *_rsync_progress_flags(), "-e", ssh_e, src, dest]
+    return run_rsync_pretty(argv, server)
 
 
 def _exec_vendor_shell(
@@ -1853,6 +2070,7 @@ def action_rsync_upload(server: core.Server) -> None:
         "rsync",
         "-avz",
         "--delete",
+        *_rsync_progress_flags(),
         "-e",
         ssh_e,
         src,
@@ -1871,13 +2089,12 @@ def action_rsync_upload(server: core.Server) -> None:
     if not _confirm_yn("Run upload rsync+chmod?", default_yes=False):
         return
     try:
-        code = run_argv(argv, server, interactive=True)
+        code = run_rsync_pretty(argv, server)
     except KeyboardInterrupt:
         print(f"\n{_CANCEL_HINT}")
         return
-    print(f"rsync exit: {code}")
     if code == 0:
-        print("Applying permission preset…")
+        print(_c(_ANSI_CYAN_DIM, "  Applying permission preset…"))
         try:
             chmod_code, used_sudo = ssh_remote_sudo_fallback(
                 server, chmod_preset_cmd(normalize_remote_path(remote)), interactive=True
@@ -1886,8 +2103,12 @@ def action_rsync_upload(server: core.Server) -> None:
             print(f"\n{_CANCEL_HINT}")
             return
         if used_sudo:
-            print("  chmod used: sudo -S")
-        print(f"chmod exit: {chmod_code}")
+            print(_c(_ANSI_CYAN_DIM, "  chmod used: sudo -S"))
+        if chmod_code == 0:
+            _print_success_line("[success] permissions applied")
+        else:
+            print(_c(_ANSI_RED, f"  chmod exit: {chmod_code}"))
+        print()
     _pause()
 
 
@@ -2028,7 +2249,7 @@ def action_rsync_download(server: core.Server) -> None:
         "rsync",
         "-avz",
         "--delete",
-        "--progress",
+        *_rsync_progress_flags(),
         "-e",
         ssh_e,
         src,
@@ -2046,11 +2267,10 @@ def action_rsync_download(server: core.Server) -> None:
     if not _confirm_yn("Run download rsync?", default_yes=False):
         return
     try:
-        code = run_argv(argv, server, interactive=True)
+        run_rsync_pretty(argv, server)
     except KeyboardInterrupt:
         print(f"\n{_CANCEL_HINT}")
         return
-    print(f"rsync exit: {code}")
     _pause()
 
 
