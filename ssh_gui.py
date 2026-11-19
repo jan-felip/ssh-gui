@@ -15,8 +15,10 @@ import select
 import shlex
 import signal
 import struct
+import subprocess
 import sys
 import termios
+import threading
 import time
 import tty
 from dataclasses import dataclass
@@ -43,7 +45,8 @@ DEFAULT_CONFIG = APP_DIR / "servers.yaml"
 EXAMPLE_CONFIG = APP_DIR / "servers.example.yaml"
 
 ADD_ACTION = "__add_host__"
-MenuItem = Union[str, "Server"]  # Server or ADD_ACTION
+UPDATE_ACTION = "__update__"
+MenuItem = Union[str, "Server"]  # Server, ADD_ACTION, or UPDATE_ACTION
 
 TITLE_ART = [
     "  " + line
@@ -552,16 +555,121 @@ def _init_colors() -> None:
     curses.init_pair(13, curses.COLOR_BLACK, curses.COLOR_CYAN)  # asterisk on selected row
     curses.init_pair(14, curses.COLOR_YELLOW, -1)  # [-] discard
     curses.init_pair(15, curses.COLOR_WHITE, curses.COLOR_YELLOW)  # discard focused
+    curses.init_pair(18, curses.COLOR_BLACK, curses.COLOR_YELLOW)  # update banner (idle)
 
 
 # ⌕ U+2315 TELEPHONE RECORDER — classic single-cell magnifier in macOS Terminal
 SEARCH_GLYPH = "\u2315"
+UPDATE_BANNER_TEXT = "  ( ! ) Update available      "
+_UPDATE_CHECK_TIMEOUT = 4.0  # seconds for background git fetch
 
 
-def _menu_items(servers: List[Server]) -> List[MenuItem]:
+class _UpdateCheckState:
+    """Shared flag for background update probe (silent on failure)."""
+
+    def __init__(self) -> None:
+        self.ready = False
+        self.available = False
+        self.lock = threading.Lock()
+
+
+def _menu_items(
+    servers: List[Server],
+    *,
+    show_update: bool = False,
+) -> List[MenuItem]:
     items: List[MenuItem] = list(servers)
     items.append(ADD_ACTION)
+    if show_update:
+        items.append(UPDATE_ACTION)
     return items
+
+
+def _git_upstream_ref(app_dir: Path) -> Optional[str]:
+    """Prefer tracking upstream (@{u}); else origin/main if it exists."""
+    try:
+        proc = subprocess.run(
+            ["git", "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"],
+            cwd=str(app_dir),
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+        if proc.returncode == 0:
+            ref = (proc.stdout or "").strip()
+            if ref:
+                return ref
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    try:
+        proc = subprocess.run(
+            ["git", "rev-parse", "--verify", "origin/main"],
+            cwd=str(app_dir),
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+        if proc.returncode == 0:
+            return "origin/main"
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    return None
+
+
+def check_update_available(
+    app_dir: Path = APP_DIR,
+    *,
+    timeout: float = _UPDATE_CHECK_TIMEOUT,
+) -> bool:
+    """
+    True when remote tip is ahead of local HEAD.
+    Silent False on offline, missing git, timeouts, or any error.
+    """
+    try:
+        app_dir = app_dir.resolve()
+        if not (app_dir / ".git").is_dir():
+            return False
+        upstream = _git_upstream_ref(app_dir)
+        if not upstream:
+            return False
+        remote = upstream.split("/", 1)[0] if "/" in upstream else "origin"
+        fetch = subprocess.run(
+            ["git", "fetch", "--quiet", remote],
+            cwd=str(app_dir),
+            capture_output=True,
+            timeout=timeout,
+        )
+        if fetch.returncode != 0:
+            return False
+        # Re-check upstream after fetch (origin/main may have moved)
+        upstream = _git_upstream_ref(app_dir) or upstream
+        count = subprocess.run(
+            ["git", "rev-list", "--count", f"HEAD..{upstream}"],
+            cwd=str(app_dir),
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+        if count.returncode != 0:
+            return False
+        n = int((count.stdout or "0").strip() or "0")
+        return n > 0
+    except Exception:  # noqa: BLE001 — intentional silent fail
+        return False
+
+
+def start_update_check(app_dir: Path = APP_DIR) -> _UpdateCheckState:
+    """Kick off a daemon thread; menu polls state without blocking startup."""
+    state = _UpdateCheckState()
+
+    def _worker() -> None:
+        avail = check_update_available(app_dir)
+        with state.lock:
+            state.available = avail
+            state.ready = True
+
+    threading.Thread(target=_worker, daemon=True, name="ssh-gui-update-check").start()
+    return state
 
 
 def _filter_servers(servers: List[Server], query: str) -> List[Server]:
@@ -627,6 +735,118 @@ def _draw_search_box(
 
     # y+3 left unpainted (default/black) as a visual gap before the table header
     return y + 4
+
+
+def _update_banner_geometry(term_w: int) -> Tuple[int, int]:
+    """Compact strip, left-aligned with 2-space indent (not centered). Returns (x0, box_w)."""
+    x0 = 2
+    text_w = len(UPDATE_BANNER_TEXT)
+    box_w = max(text_w, min(40, max(8, term_w - 1 - x0 * 2)))
+    box_w = min(box_w, max(0, term_w - 1 - x0))
+    return x0, box_w
+
+
+def _draw_update_banner_row(
+    stdscr: "curses._CursesWindow",
+    y: int,
+    term_w: int,
+    *,
+    text: Optional[str] = None,
+    selected: bool = False,
+) -> None:
+    """One row of the update strip (empty pad or middle label). Yellow or cyan when selected."""
+    x0, box_w = _update_banner_geometry(term_w)
+    if box_w <= 0:
+        return
+    # Idle: black on yellow; selected: same cyan pair as host rows (pair 1)
+    attr = (curses.color_pair(1) | curses.A_BOLD) if selected else curses.color_pair(18)
+    if text:
+        body = text[:box_w]
+        pad = max(0, box_w - len(body))
+        _safe_add(stdscr, y, x0, body + (" " * pad), attr)
+    else:
+        _safe_add(stdscr, y, x0, " " * box_w, attr)
+
+
+def _run_in_app_dir(argv: List[str], *, cwd: Path) -> int:
+    """Run a command in APP_DIR; stream output to the terminal. Returns exit code."""
+    print(f"$ {' '.join(argv)}")
+    try:
+        proc = subprocess.run(argv, cwd=str(cwd))
+        return int(proc.returncode)
+    except OSError as exc:
+        print(f"Failed to run {argv[0]}: {exc}", file=sys.stderr)
+        return 127
+
+
+def run_self_update(app_dir: Path = APP_DIR) -> int:
+    """
+    Update ssh-gui from git in app_dir, then reinstall.
+
+    Prefer `git fetch` + `git pull --ff-only` (never reset --hard).
+    If the working tree is dirty, refuse and report — do not discard local changes.
+    """
+    app_dir = app_dir.resolve()
+    print()
+    print("=" * 56)
+    print(f"  Updating ssh-gui in {app_dir}")
+    print("=" * 56)
+    print()
+
+    if not (app_dir / ".git").exists():
+        print(f"Not a git checkout: {app_dir}", file=sys.stderr)
+        print("Clone the repo or update manually.")
+        return 1
+
+    # Dirty check — report and stop (no hard reset)
+    try:
+        st = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=str(app_dir),
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        print(f"git status failed: {exc}", file=sys.stderr)
+        return 1
+    dirty = (st.stdout or "").strip()
+    if dirty:
+        print("Working tree is dirty — refusing to update (no reset --hard).")
+        print("Commit or stash local changes, then try again.")
+        print()
+        print(dirty)
+        print()
+        return 1
+
+    code = _run_in_app_dir(["git", "fetch"], cwd=app_dir)
+    if code != 0:
+        print(f"git fetch failed (exit {code})", file=sys.stderr)
+        return code
+
+    code = _run_in_app_dir(["git", "pull", "--ff-only"], cwd=app_dir)
+    if code != 0:
+        print(f"git pull --ff-only failed (exit {code})", file=sys.stderr)
+        print("Tree may have diverged; resolve manually (no hard reset).")
+        return code
+
+    install = app_dir / "install.sh"
+    if not install.is_file():
+        print(f"Missing {install}", file=sys.stderr)
+        return 1
+    code = _run_in_app_dir(["./install.sh"], cwd=app_dir)
+    if code != 0:
+        print(f"install.sh failed (exit {code})", file=sys.stderr)
+        return code
+
+    print()
+    print("=" * 56)
+    print("  Update finished.")
+    print("  Restart ssh-gui to load the new code:")
+    print("    exit this session (Ctrl+C), then run:  ssh-gui")
+    print("=" * 56)
+    print()
+    return 0
 
 
 def _fit_cell(text: str, width: int) -> str:
@@ -1216,9 +1436,13 @@ def menu_loop(config_path: Path, dry_run: bool = False) -> Tuple[str, Optional[S
                 pass
         curses.curs_set(0)
         _init_colors()
+        # Periodic wake so the background update probe can show the banner without a keypress
+        stdscr.timeout(250)
         idx = 0
         search_open = False
         search_query = ""
+        update_state = start_update_check(APP_DIR)
+        show_update = False
 
         while True:
             try:
@@ -1231,17 +1455,21 @@ def menu_loop(config_path: Path, dry_run: bool = False) -> Tuple[str, Optional[S
             except (ValueError, yaml.YAMLError) as exc:
                 stdscr.clear()
                 stdscr.addstr(0, 0, f"Config error: {exc}")
-                stdscr.addstr(2, 0, "Press any key to quit.")
+                stdscr.timeout(-1)
                 stdscr.getch()
                 return ("quit", None)
+
+            with update_state.lock:
+                if update_state.ready:
+                    show_update = update_state.available
 
             visible_servers = (
                 _filter_servers(servers, search_query) if search_open else servers
             )
-            items = _menu_items(visible_servers)
+            items = _menu_items(visible_servers, show_update=show_update)
             if idx >= len(items):
                 idx = max(0, len(items) - 1)
-            # Visual rows: servers, blank separator (if any servers), add action
+            # Visual rows: servers, blank separator (if any servers), add / update
             # Navigation index maps over items only (not the blank line)
 
             stdscr.clear()
@@ -1267,28 +1495,49 @@ def menu_loop(config_path: Path, dry_run: bool = False) -> Tuple[str, Optional[S
                 content_top = list_top + 1
 
             # Build display rows: (item_index or None for blank, kind)
-            # kind: 'server' | 'blank' | 'add'
+            # kind: 'server' | 'blank' | 'add' | 'update_gap' | 'update_pad' | 'update'
             display_rows: List[Tuple[Optional[int], str]] = []
             for i, item in enumerate(items):
                 if item == ADD_ACTION:
                     if visible_servers:
                         display_rows.append((None, "blank"))
                     display_rows.append((i, "add"))
+                elif item == UPDATE_ACTION:
+                    # 2 blank lines, then 3-row strip (all tied to this selectable item)
+                    display_rows.append((None, "update_gap"))
+                    display_rows.append((None, "update_gap"))
+                    display_rows.append((i, "update_pad"))
+                    display_rows.append((i, "update"))
+                    display_rows.append((i, "update_pad"))
                 else:
                     display_rows.append((i, "server"))
 
             # Find which display row corresponds to idx for scrolling
             focus_row = next(r for r, (ii, _) in enumerate(display_rows) if ii == idx)
             visible = max(1, h - content_top - 1)
-            start_row = max(0, min(focus_row - visible + 1, len(display_rows) - visible))
+            # Pin bottom when Add host or Update strip is focused
+            if items and items[idx] in (ADD_ACTION, UPDATE_ACTION):
+                start_row = max(0, len(display_rows) - visible)
+            else:
+                start_row = max(
+                    0, min(focus_row - visible + 1, len(display_rows) - visible)
+                )
 
             for row_i, (item_i, kind) in enumerate(display_rows[start_row : start_row + visible]):
                 y = content_top + row_i
                 if y >= h:
                     break
-                if kind == "blank":
+                if kind in ("blank", "update_gap"):
                     continue
                 selected = item_i == idx
+                if kind == "update_pad":
+                    _draw_update_banner_row(stdscr, y, w, selected=selected)
+                    continue
+                if kind == "update":
+                    _draw_update_banner_row(
+                        stdscr, y, w, text=UPDATE_BANNER_TEXT, selected=selected
+                    )
+                    continue
                 if kind == "add":
                     _draw_add_label(stdscr, y, w, selected)
                 else:
@@ -1306,6 +1555,9 @@ def menu_loop(config_path: Path, dry_run: bool = False) -> Tuple[str, Optional[S
 
             stdscr.refresh()
             key = stdscr.getch()
+            if key == -1:
+                # timeout tick — redraw (may reveal Update banner)
+                continue
             n = len(items) if items else 1
 
             # Esc: clear/close search only — never quit the main list
@@ -1342,7 +1594,7 @@ def menu_loop(config_path: Path, dry_run: bool = False) -> Tuple[str, Optional[S
                 continue
             if key == curses.KEY_RIGHT:
                 chosen = items[idx]
-                if chosen == ADD_ACTION:
+                if chosen in (ADD_ACTION, UPDATE_ACTION):
                     continue
                 assert isinstance(chosen, Server)
                 # Late import avoids circular load at startup
@@ -1351,7 +1603,7 @@ def menu_loop(config_path: Path, dry_run: bool = False) -> Tuple[str, Optional[S
                 host_actions_menu(stdscr, config_path, chosen)
                 # Reload in case actions patched yaml
                 servers = load_servers(config_path)
-                items = _menu_items(servers)
+                items = _menu_items(servers, show_update=show_update)
                 # Keep selection on same host name when possible
                 for i, it in enumerate(items):
                     if isinstance(it, Server) and it.name == chosen.name:
@@ -1362,6 +1614,30 @@ def menu_loop(config_path: Path, dry_run: bool = False) -> Tuple[str, Optional[S
                 continue
             elif key in (curses.KEY_ENTER, 10, 13):
                 chosen = items[idx]
+                if chosen == UPDATE_ACTION:
+                    # Leave curses, run git ff-only + install.sh, then resume menu
+                    curses.def_prog_mode()
+                    curses.endwin()
+                    try:
+                        code = run_self_update(APP_DIR)
+                    except KeyboardInterrupt:
+                        print("\nUpdate cancelled.")
+                        code = 1
+                    try:
+                        input("Press Enter to return to the menu…")
+                    except (EOFError, KeyboardInterrupt):
+                        pass
+                    curses.reset_prog_mode()
+                    stdscr.timeout(250)
+                    stdscr.clear()
+                    stdscr.refresh()
+                    if code == 0:
+                        with update_state.lock:
+                            update_state.available = False
+                            update_state.ready = True
+                        show_update = False
+                        idx = max(0, len(_menu_items(servers, show_update=False)) - 1)
+                    continue
                 if chosen == ADD_ACTION:
                     existing = {s.name for s in servers}
                     result = add_host_form(stdscr, existing)
@@ -1375,11 +1651,12 @@ def menu_loop(config_path: Path, dry_run: bool = False) -> Tuple[str, Optional[S
                     except ValueError as exc:
                         stdscr.clear()
                         stdscr.addstr(0, 0, f"Could not save: {exc}")
-                        stdscr.addstr(2, 0, "Press any key…")
+                        stdscr.timeout(-1)
                         stdscr.getch()
+                        stdscr.timeout(250)
                         continue
                     servers = load_servers(config_path)
-                    items = _menu_items(servers)
+                    items = _menu_items(servers, show_update=show_update)
                     for i, it in enumerate(items):
                         if isinstance(it, Server) and it.name == new_server.name:
                             idx = i
@@ -1389,7 +1666,7 @@ def menu_loop(config_path: Path, dry_run: bool = False) -> Tuple[str, Optional[S
                 return ("connect", chosen)
             elif key in (ord("e"), ord("E")):
                 chosen = items[idx]
-                if chosen == ADD_ACTION:
+                if chosen in (ADD_ACTION, UPDATE_ACTION):
                     continue  # edit only applies to host rows
                 assert isinstance(chosen, Server)
                 existing = {s.name for s in servers}
@@ -1403,11 +1680,12 @@ def menu_loop(config_path: Path, dry_run: bool = False) -> Tuple[str, Optional[S
                     except ValueError as exc:
                         stdscr.clear()
                         stdscr.addstr(0, 0, f"Could not remove: {exc}")
-                        stdscr.addstr(2, 0, "Press any key…")
+                        stdscr.timeout(-1)
                         stdscr.getch()
+                        stdscr.timeout(250)
                         continue
                     servers = load_servers(config_path)
-                    items = _menu_items(servers)
+                    items = _menu_items(servers, show_update=show_update)
                     idx = min(idx, max(0, len(items) - 1))
                     continue
                 if action != "save" or edited is None:
@@ -1417,11 +1695,12 @@ def menu_loop(config_path: Path, dry_run: bool = False) -> Tuple[str, Optional[S
                 except ValueError as exc:
                     stdscr.clear()
                     stdscr.addstr(0, 0, f"Could not save: {exc}")
-                    stdscr.addstr(2, 0, "Press any key…")
+                    stdscr.timeout(-1)
                     stdscr.getch()
+                    stdscr.timeout(250)
                     continue
                 servers = load_servers(config_path)
-                items = _menu_items(servers)
+                items = _menu_items(servers, show_update=show_update)
                 for i, it in enumerate(items):
                     if isinstance(it, Server) and it.name == edited.name:
                         idx = i
