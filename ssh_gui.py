@@ -562,6 +562,59 @@ def _init_colors() -> None:
 SEARCH_GLYPH = "\u2315"
 UPDATE_BANNER_TEXT = "  ( ! ) Update available      "
 _UPDATE_CHECK_TIMEOUT = 4.0  # seconds for background git fetch
+_MENU_POLL_MS = 250  # main-list getch wake for update-banner poll
+
+
+def _curses_blocking_input(stdscr: "curses._CursesWindow") -> None:
+    """Blocking keyed input for forms/actions (clears menu timeout/nodelay)."""
+    try:
+        stdscr.nodelay(False)
+    except curses.error:
+        pass
+    try:
+        stdscr.keypad(True)
+    except curses.error:
+        pass
+    stdscr.timeout(-1)
+
+
+def _curses_menu_poll_input(stdscr: "curses._CursesWindow") -> None:
+    """Restore main-menu poll timeout after leaving a form/actions."""
+    try:
+        stdscr.nodelay(False)
+    except curses.error:
+        pass
+    try:
+        stdscr.keypad(True)
+    except curses.error:
+        pass
+    stdscr.timeout(_MENU_POLL_MS)
+
+
+def _curses_getch(stdscr: "curses._CursesWindow") -> int:
+    """Blocking getch; retries on timeout (-1) or curses.error ('no input')."""
+    _curses_blocking_input(stdscr)
+    while True:
+        try:
+            key = stdscr.getch()
+        except curses.error:
+            _curses_blocking_input(stdscr)
+            continue
+        if key == -1:
+            _curses_blocking_input(stdscr)
+            continue
+        return key
+
+
+def _curses_get_wch(stdscr: "curses._CursesWindow"):
+    """Blocking get_wch; retries when timeout/nodelay raises 'no input'."""
+    _curses_blocking_input(stdscr)
+    while True:
+        try:
+            return stdscr.get_wch()
+        except curses.error:
+            _curses_blocking_input(stdscr)
+            continue
 
 
 class _UpdateCheckState:
@@ -1013,6 +1066,7 @@ ACTION_SAVE = "save"
 
 def _confirm_dialog(stdscr: "curses._CursesWindow", message: str) -> bool:
     """Simple Enter=yes / Esc=no confirm strip at the bottom."""
+    _curses_blocking_input(stdscr)
     h, w = stdscr.getmaxyx()
     prompt = f"{message}  Enter=yes  Esc=no"
     try:
@@ -1027,11 +1081,12 @@ def _confirm_dialog(stdscr: "curses._CursesWindow", message: str) -> bool:
     except curses.error:
         pass
     while True:
-        key = stdscr.getch()
+        key = _curses_getch(stdscr)
         if key in (curses.KEY_ENTER, 10, 13, ord("y"), ord("Y")):
             return True
         if key in (27, ord("n"), ord("N"), ord("q")):
             return False
+        # Ignore arrows / other keys (avoid raw escapes on confirm)
 
 
 def _commit_field_buf(values: Dict[str, str], key: str, buf: List[str]) -> None:
@@ -1110,6 +1165,8 @@ def host_form(
     Enter commits the field and moves to the next row (or runs an action).
     Returns ('save', Server), ('remove', None), or None if cancelled.
     """
+    # Menu may leave timeout/nodelay on; get_wch then raises "no input".
+    _curses_blocking_input(stdscr)
     editing = initial is not None
     if initial:
         values: Dict[str, str] = {
@@ -1307,7 +1364,7 @@ def host_form(
                 pass
         stdscr.refresh()
 
-        key = stdscr.get_wch()
+        key = _curses_get_wch(stdscr)
 
         if key in (curses.KEY_UP,):
             focus_row(idx - 1)
@@ -1325,8 +1382,10 @@ def host_form(
                     # Directory picker owns durable web_local config
                     from host_actions import pick_local_directory
 
+                    _curses_blocking_input(stdscr)
                     start = values["web_local"] or None
                     picked = pick_local_directory(stdscr, start)
+                    _curses_blocking_input(stdscr)
                     if picked is not None:
                         values["web_local"] = _identity_display(picked) or picked
                         buf = list(values["web_local"])
@@ -1437,7 +1496,7 @@ def menu_loop(config_path: Path, dry_run: bool = False) -> Tuple[str, Optional[S
         curses.curs_set(0)
         _init_colors()
         # Periodic wake so the background update probe can show the banner without a keypress
-        stdscr.timeout(250)
+        _curses_menu_poll_input(stdscr)
         idx = 0
         search_open = False
         search_query = ""
@@ -1455,8 +1514,8 @@ def menu_loop(config_path: Path, dry_run: bool = False) -> Tuple[str, Optional[S
             except (ValueError, yaml.YAMLError) as exc:
                 stdscr.clear()
                 stdscr.addstr(0, 0, f"Config error: {exc}")
-                stdscr.timeout(-1)
-                stdscr.getch()
+                stdscr.addstr(2, 0, "Press any key to quit.")
+                _curses_getch(stdscr)
                 return ("quit", None)
 
             with update_state.lock:
@@ -1554,7 +1613,11 @@ def menu_loop(config_path: Path, dry_run: bool = False) -> Tuple[str, Optional[S
                     )
 
             stdscr.refresh()
-            key = stdscr.getch()
+            try:
+                key = stdscr.getch()
+            except curses.error:
+                _curses_menu_poll_input(stdscr)
+                continue
             if key == -1:
                 # timeout tick — redraw (may reveal Update banner)
                 continue
@@ -1600,7 +1663,9 @@ def menu_loop(config_path: Path, dry_run: bool = False) -> Tuple[str, Optional[S
                 # Late import avoids circular load at startup
                 from host_actions import host_actions_menu
 
+                _curses_blocking_input(stdscr)
                 host_actions_menu(stdscr, config_path, chosen)
+                _curses_menu_poll_input(stdscr)
                 # Reload in case actions patched yaml
                 servers = load_servers(config_path)
                 items = _menu_items(servers, show_update=show_update)
@@ -1628,7 +1693,8 @@ def menu_loop(config_path: Path, dry_run: bool = False) -> Tuple[str, Optional[S
                     except (EOFError, KeyboardInterrupt):
                         pass
                     curses.reset_prog_mode()
-                    stdscr.timeout(250)
+                    _curses_blocking_input(stdscr)
+                    _curses_menu_poll_input(stdscr)
                     stdscr.clear()
                     stdscr.refresh()
                     if code == 0:
@@ -1640,7 +1706,9 @@ def menu_loop(config_path: Path, dry_run: bool = False) -> Tuple[str, Optional[S
                     continue
                 if chosen == ADD_ACTION:
                     existing = {s.name for s in servers}
+                    _curses_blocking_input(stdscr)
                     result = add_host_form(stdscr, existing)
+                    _curses_menu_poll_input(stdscr)
                     if result is None:
                         continue
                     action, new_server = result
@@ -1651,9 +1719,8 @@ def menu_loop(config_path: Path, dry_run: bool = False) -> Tuple[str, Optional[S
                     except ValueError as exc:
                         stdscr.clear()
                         stdscr.addstr(0, 0, f"Could not save: {exc}")
-                        stdscr.timeout(-1)
-                        stdscr.getch()
-                        stdscr.timeout(250)
+                        _curses_getch(stdscr)
+                        _curses_menu_poll_input(stdscr)
                         continue
                     servers = load_servers(config_path)
                     items = _menu_items(servers, show_update=show_update)
@@ -1670,7 +1737,9 @@ def menu_loop(config_path: Path, dry_run: bool = False) -> Tuple[str, Optional[S
                     continue  # edit only applies to host rows
                 assert isinstance(chosen, Server)
                 existing = {s.name for s in servers}
+                _curses_blocking_input(stdscr)
                 result = edit_host_form(stdscr, existing, chosen)
+                _curses_menu_poll_input(stdscr)
                 if result is None:
                     continue
                 action, edited = result
@@ -1680,9 +1749,8 @@ def menu_loop(config_path: Path, dry_run: bool = False) -> Tuple[str, Optional[S
                     except ValueError as exc:
                         stdscr.clear()
                         stdscr.addstr(0, 0, f"Could not remove: {exc}")
-                        stdscr.timeout(-1)
-                        stdscr.getch()
-                        stdscr.timeout(250)
+                        _curses_getch(stdscr)
+                        _curses_menu_poll_input(stdscr)
                         continue
                     servers = load_servers(config_path)
                     items = _menu_items(servers, show_update=show_update)
@@ -1695,9 +1763,8 @@ def menu_loop(config_path: Path, dry_run: bool = False) -> Tuple[str, Optional[S
                 except ValueError as exc:
                     stdscr.clear()
                     stdscr.addstr(0, 0, f"Could not save: {exc}")
-                    stdscr.timeout(-1)
-                    stdscr.getch()
-                    stdscr.timeout(250)
+                    _curses_getch(stdscr)
+                    _curses_menu_poll_input(stdscr)
                     continue
                 servers = load_servers(config_path)
                 items = _menu_items(servers, show_update=show_update)

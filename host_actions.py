@@ -11,6 +11,8 @@ import re
 import shlex
 import subprocess
 import sys
+import termios
+import tty
 import urllib.parse
 from dataclasses import replace
 from datetime import datetime
@@ -35,9 +37,16 @@ def _suspend_curses(stdscr: "curses._CursesWindow") -> None:
 
 
 def _resume_curses(stdscr: "curses._CursesWindow") -> None:
+    """Restore TUI after endwin; always re-enable blocking keypad input."""
     curses.reset_prog_mode()
+    core._curses_blocking_input(stdscr)
     stdscr.clear()
     stdscr.refresh()
+
+
+def _getch_blocking(stdscr: "curses._CursesWindow") -> int:
+    """Blocking getch shared by actions/pickers; ignores timeout/-1/no-input."""
+    return core._curses_getch(stdscr)
 
 
 _CANCEL_HINT = "Cancelled. Press Esc or ← to leave the actions menu."
@@ -45,9 +54,38 @@ _RUN_KEYS_NOTE = "keys:  Enter to run · Esc / ← in menu to cancel"
 
 
 def _pause(msg: str = "Press Enter to continue…") -> bool:
-    """Return False if cancelled (Ctrl+C). Never raises KeyboardInterrupt."""
+    """Wait for Enter; swallow arrow escapes (no ^[[D dump). Ctrl+C cancels."""
     try:
-        input(msg)
+        sys.stdout.write(msg)
+        sys.stdout.flush()
+        if not sys.stdin.isatty():
+            sys.stdin.readline()
+            return True
+        fd = sys.stdin.fileno()
+        old = termios.tcgetattr(fd)
+        try:
+            tty.setcbreak(fd)
+            while True:
+                ch = sys.stdin.read(1)
+                if ch in ("\n", "\r"):
+                    sys.stdout.write("\n")
+                    sys.stdout.flush()
+                    return True
+                if ch == "\x03":
+                    raise KeyboardInterrupt
+                if ch == "\x1b":
+                    # Drain CSI / SS3 (arrows) without echoing
+                    nxt = sys.stdin.read(1)
+                    if nxt == "[":
+                        while True:
+                            c = sys.stdin.read(1)
+                            if not c or c.isalpha() or c == "~":
+                                break
+                    elif nxt == "O":
+                        sys.stdin.read(1)
+                # ignore other keys (no echo)
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old)
         return True
     except EOFError:
         return True
@@ -1217,7 +1255,7 @@ def pick_dump_source(stdscr: "curses._CursesWindow") -> Optional[str]:
                 attr = curses.A_NORMAL
             core._safe_add(stdscr, y, 2, label[: max(0, w - 3)], attr)
         stdscr.refresh()
-        key = stdscr.getch()
+        key = _getch_blocking(stdscr)
         if key in (curses.KEY_UP, ord("k")):
             focus = (focus - 1) % len(options)
         elif key in (curses.KEY_DOWN, ord("j")):
@@ -1296,7 +1334,7 @@ def pick_local_dump_file(
             core._safe_add(stdscr, y, 2, label[: max(0, w - 3)], attr)
 
         stdscr.refresh()
-        key = stdscr.getch()
+        key = _getch_blocking(stdscr)
         if not rows:
             if key in (27, ord("q"), curses.KEY_LEFT):
                 if cwd.parent != cwd:
@@ -1437,7 +1475,7 @@ def pick_remote_dump_file(
             core._safe_add(stdscr, y, 2, label[: max(0, w - 3)], attr)
 
         stdscr.refresh()
-        key = stdscr.getch()
+        key = _getch_blocking(stdscr)
         if not rows:
             if key in (27, ord("q")):
                 return None
@@ -2155,7 +2193,7 @@ def pick_local_directory(
             core._safe_add(stdscr, y, 2, label[: max(0, w - 3)], attr)
 
         stdscr.refresh()
-        key = stdscr.getch()
+        key = _getch_blocking(stdscr)
         if key in (curses.KEY_UP, ord("k")):
             idx = (idx - 1) % len(rows)
         elif key in (curses.KEY_DOWN, ord("j")):
@@ -2272,18 +2310,229 @@ def action_rsync_upload(server: core.Server) -> None:
     _pause()
 
 
-def action_git_pull(server: core.Server) -> None:
-    """Uses git_user/git_token from Edit/yaml when set. No settings prompts here."""
-    if not server.web_remote:
-        return
-    path_q = shlex.quote(normalize_remote_path(server.web_remote))
+# Backup dir for Keep-local-changes pull (listed in .git/info/exclude).
+_PULL_KEEP_DIR = ".ssh-gui-pull-keep"
 
+
+def _ssh_out_payload(out: str) -> str:
+    """Drop ssh password prompts / CR noise from captured remote output."""
+    lines: List[str] = []
+    for ln in (out or "").splitlines():
+        low = ln.lower()
+        if "password:" in low and ("'s password" in low or "password: " in low):
+            continue
+        lines.append(ln.replace("\r", ""))
+    return "\n".join(lines)
+
+
+def _porcelain_paths(porcelain: str) -> List[str]:
+    """Parse `git status --porcelain` into relative paths (handles renames)."""
+    paths: List[str] = []
+    for raw in (porcelain or "").splitlines():
+        line = raw.rstrip("\r")
+        if len(line) < 4:
+            continue
+        path = line[3:]
+        if " -> " in path:
+            path = path.split(" -> ", 1)[1]
+        path = path.strip().strip('"')
+        if not path or path.startswith(_PULL_KEEP_DIR):
+            continue
+        paths.append(path)
+    # stable unique
+    seen = set()
+    out: List[str] = []
+    for p in paths:
+        if p not in seen:
+            seen.add(p)
+            out.append(p)
+    return out
+
+
+def _dirty_path_kind(path: str) -> str:
+    """Bucket dirty paths for the pull UX summary."""
+    p = path.replace("\\", "/")
+    if p == "core" or p.startswith("core/"):
+        return "core"
+    if (
+        p.startswith("vendor/")
+        or p in ("composer.lock", "composer.json", "composer.phar")
+    ):
+        return "vendor"
+    return "site"
+
+
+def _prompt_dirty_pull_choice(prompt: str = "Choice") -> Optional[str]:
+    """Return 'discard' | 'keep' | 'select' | None (cancel)."""
+    try:
+        ans = input(
+            f"{prompt} [D]iscard / [K]eep all / [S]elect / [C]ancel: "
+        ).strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print(f"\n{_CANCEL_HINT}")
+        return None
+    if not ans or ans in ("c", "cancel", "q"):
+        return None
+    if ans in ("d", "discard"):
+        return "discard"
+    if ans in ("k", "keep"):
+        return "keep"
+    if ans in ("s", "select"):
+        return "select"
+    print(_c(_ANSI_YELLOW, "  Unknown choice — cancelled."))
+    return None
+
+
+def _kind_label(kind: str) -> str:
+    if kind == "core":
+        return "core"
+    if kind == "vendor":
+        return "vendor"
+    return "site"
+
+
+def pick_dirty_keep_paths(
+    stdscr: "curses._CursesWindow",
+    paths: List[str],
+) -> Optional[List[str]]:
+    """
+    Multi-select dirty paths to KEEP after pull.
+    Space toggles, Enter confirms, Esc cancels.
+    Returns selected paths (may be empty), or None if cancelled.
+    """
+    if not paths:
+        return []
+    # Default: all selected (same as Keep all until user untoggles)
+    selected = [True] * len(paths)
+    focus = 0
+    curses.curs_set(0)
+    core._curses_blocking_input(stdscr)
+
+    while True:
+        stdscr.clear()
+        h, w = stdscr.getmaxyx()
+        core._safe_add(
+            stdscr,
+            0,
+            0,
+            "Select files to KEEP (unchecked → discarded by reset)",
+            curses.A_BOLD,
+        )
+        core._safe_add(
+            stdscr,
+            1,
+            0,
+            "↑↓ move · Space toggle · a all · n none · Enter confirm · Esc cancel",
+            curses.color_pair(2),
+        )
+        n_keep = sum(1 for s in selected if s)
+        core._safe_add(
+            stdscr,
+            2,
+            0,
+            f"Keeping {n_keep}/{len(paths)}",
+            curses.A_DIM,
+        )
+        top = 4
+        visible = max(1, h - top - 1)
+        focus = max(0, min(focus, len(paths) - 1))
+        start_i = max(0, min(focus - visible + 1, max(0, len(paths) - visible)))
+        for row_i, path in enumerate(paths[start_i : start_i + visible]):
+            y = top + row_i
+            i = start_i + row_i
+            mark = "[x]" if selected[i] else "[ ]"
+            kind = _kind_label(_dirty_path_kind(path))
+            label = f"{mark} {path}  ({kind})"
+            is_focus = i == focus
+            if is_focus:
+                try:
+                    stdscr.addnstr(
+                        y, 0, " " * max(0, w - 1), w - 1, curses.color_pair(1)
+                    )
+                except curses.error:
+                    pass
+                attr = curses.color_pair(1) | curses.A_BOLD
+            else:
+                attr = curses.A_NORMAL
+            core._safe_add(stdscr, y, 2, label[: max(0, w - 3)], attr)
+        stdscr.refresh()
+
+        key = _getch_blocking(stdscr)
+        if key in (curses.KEY_UP, ord("k")):
+            focus = (focus - 1) % len(paths)
+        elif key in (curses.KEY_DOWN, ord("j")):
+            focus = (focus + 1) % len(paths)
+        elif key == ord(" "):
+            selected[focus] = not selected[focus]
+        elif key in (ord("a"), ord("A")):
+            selected = [True] * len(paths)
+        elif key in (ord("n"), ord("N")):
+            selected = [False] * len(paths)
+        elif key in (27, ord("q")):
+            return None
+        elif key in (curses.KEY_ENTER, 10, 13):
+            return [p for p, on in zip(paths, selected) if on]
+
+
+def _git_pull_keep_script(
+    path_q: str,
+    pull_snip: str,
+    keep_paths: List[str],
+) -> str:
+    """
+    Backup only keep_paths → exclude dir → reset --hard → pull → restore.
+    Unlisted dirty files are discarded by the reset.
+    """
+    keep_root = shlex.quote(_PULL_KEEP_DIR)
+    copy_lines: List[str] = []
+    for p in keep_paths:
+        pq = shlex.quote(p)
+        copy_lines.append(
+            f"""
+if [ -e {pq} ] || [ -L {pq} ]; then
+  mkdir -p "$KEEP/$(dirname -- {pq})"
+  cp -a -- {pq} "$KEEP"/{pq}
+  printf '%s\\n' {pq} >> "$KEEP/MANIFEST"
+fi
+"""
+        )
+    copies = "\n".join(copy_lines) if copy_lines else "true\n"
+    return f"""
+set -e
+cd {path_q}
+KEEP_ROOT={keep_root}
+STAMP=$(date +%Y%m%d-%H%M%S)
+KEEP="$KEEP_ROOT/$STAMP"
+mkdir -p "$KEEP"
+mkdir -p .git/info
+EXCLUDE=.git/info/exclude
+touch "$EXCLUDE"
+grep -qxF "$KEEP_ROOT/" "$EXCLUDE" 2>/dev/null || echo "$KEEP_ROOT/" >> "$EXCLUDE"
+: > "$KEEP/MANIFEST"
+git status --porcelain > "$KEEP/status.before" || true
+{copies}
+echo "Keep: backed up $(wc -l < "$KEEP/MANIFEST" | tr -d ' ') path(s) -> $KEEP"
+git reset --hard HEAD
+{pull_snip}
+if [ -f "$KEEP/MANIFEST" ]; then
+  while IFS= read -r path || [ -n "$path" ]; do
+    [ -z "$path" ] && continue
+    if [ -e "$KEEP/$path" ] || [ -L "$KEEP/$path" ]; then
+      mkdir -p "$(dirname -- "$path")"
+      cp -a -- "$KEEP/$path" "$path"
+    fi
+  done < "$KEEP/MANIFEST"
+  echo "Keep: restored overwrite from $KEEP"
+fi
+"""
+
+
+def _git_pull_ff_snippet(server: core.Server) -> str:
+    """Shell fragment: ff-only pull (auth URL when git_user/token set)."""
     if server.git_user and server.git_token:
         u = urllib.parse.quote(server.git_user, safe="")
         t = urllib.parse.quote(server.git_token, safe="")
-        remote_script = f"""
-set -e
-cd {path_q}
+        return f"""
 ORIGIN=$(git remote get-url origin)
 case "$ORIGIN" in
   https://*)
@@ -2297,12 +2546,48 @@ case "$ORIGIN" in
     ;;
 esac
 """
-    else:
-        remote_script = f"set -e; cd {path_q}; git pull --ff-only"
+    return "git pull --ff-only\n"
+
+
+def remote_git_dirty_list(
+    server: core.Server,
+) -> Tuple[int, List[str], str]:
+    """
+    Return (code, porcelain paths, raw payload). code!=0 → probe failed.
+    Does not modify the remote.
+    """
+    if not server.web_remote:
+        return 1, [], "no web_remote"
+    path_q = shlex.quote(normalize_remote_path(server.web_remote))
+    cmd = f"cd {path_q} && git status --porcelain"
+    code, out, _sudo = ssh_remote_capture_sudo_fallback(
+        server, cmd, timeout=60.0, always_retry=True
+    )
+    payload = _ssh_out_payload(out)
+    if code != 0:
+        return code, [], payload
+    return 0, _porcelain_paths(payload), payload
+
+
+def action_git_pull(
+    server: core.Server,
+    stdscr: Optional["curses._CursesWindow"] = None,
+) -> None:
+    """
+    git pull --ff-only on web_remote.
+    If dirty: Discard (reset --hard + pull, y/N), Keep all, or Select
+    (curses multi-select: kept → same exclude/backup/restore; unkept →
+    discarded by reset). Never pushes.
+    """
+    if not server.web_remote:
+        return
+    path = normalize_remote_path(server.web_remote)
+    path_q = shlex.quote(path)
+    pull_snip = _git_pull_ff_snippet(server)
 
     info_lines = [
         f"host:  {server.label}",
-        f"path:  {normalize_remote_path(server.web_remote)}",
+        f"path:  {path}",
         f"mode:  git pull --ff-only",
     ]
     if server.git_user:
@@ -2312,16 +2597,134 @@ esac
     info_lines.append("note:  non-sudo first; sudo -S fallback if password in YAML")
     info_lines.append(_RUN_KEYS_NOTE)
     _print_info_panel("Git pull", info_lines)
+
+    print(_c(_ANSI_CYAN_DIM, "  Checking remote working tree…"))
+    try:
+        probe_code, dirty_paths, probe_out = remote_git_dirty_list(server)
+    except KeyboardInterrupt:
+        print(f"\n{_CANCEL_HINT}")
+        return
+    if probe_code != 0:
+        _print_error_panel(
+            "Could not read git status",
+            [f"host: {server.label}", f"path: {path}"],
+            probe_out,
+        )
+        _pause()
+        return
+
+    mode = "clean"  # clean | discard | keep
+    keep_paths: List[str] = []
+    if dirty_paths:
+        by_kind: Dict[str, List[str]] = {"core": [], "vendor": [], "site": []}
+        for p in dirty_paths:
+            by_kind[_dirty_path_kind(p)].append(p)
+        lines = [
+            f"{len(dirty_paths)} dirty path(s) on remote — pull needs a clean tree.",
+            "Discard = git reset --hard HEAD, then pull (loses all local edits).",
+            f"Keep    = backup all to {_PULL_KEEP_DIR}/, reset, pull, restore.",
+            "Select  = choose which files to keep (Space); rest discarded by reset.",
+            "",
+        ]
+        for kind, label in (
+            ("core", "Drupal core"),
+            ("vendor", "Composer / vendor"),
+            ("site", "Site-specific"),
+        ):
+            group = by_kind[kind]
+            if not group:
+                continue
+            lines.append(f"{label}:")
+            for p in group:
+                lines.append(f"  · {p}")
+            lines.append("")
+        _print_info_panel("Local changes on remote", lines)
+        choice = _prompt_dirty_pull_choice()
+        if choice is None:
+            return
+        if choice == "discard":
+            if not _confirm_yn(
+                "Discard ALL listed local changes on the remote?",
+                default_yes=False,
+            ):
+                print(_c(_ANSI_YELLOW, "  Cancelled — nothing discarded."))
+                _pause()
+                return
+            mode = "discard"
+        elif choice == "keep":
+            mode = "keep"
+            keep_paths = list(dirty_paths)
+        else:  # select
+            if stdscr is None:
+                print(
+                    _c(
+                        _ANSI_RED,
+                        "  Select needs the TUI window — use Keep/Discard, or reopen →.",
+                    )
+                )
+                _pause()
+                return
+            # Picker needs curses; we are suspended (endwin) for stdout panels
+            curses.reset_prog_mode()
+            core._curses_blocking_input(stdscr)
+            try:
+                picked = pick_dirty_keep_paths(stdscr, dirty_paths)
+            finally:
+                curses.def_prog_mode()
+                curses.endwin()
+            if picked is None:
+                print(_c(_ANSI_YELLOW, "  Select cancelled."))
+                _pause()
+                return
+            if not picked:
+                if not _confirm_yn(
+                    "No files selected — discard ALL local changes?",
+                    default_yes=False,
+                ):
+                    print(_c(_ANSI_YELLOW, "  Cancelled."))
+                    _pause()
+                    return
+                mode = "discard"
+            else:
+                mode = "keep"
+                keep_paths = picked
+                print(
+                    _c(
+                        _ANSI_CYAN_DIM,
+                        f"  Keeping {len(keep_paths)}/{len(dirty_paths)} path(s); "
+                        "rest discarded by reset.",
+                    )
+                )
+    else:
+        print(_c(_ANSI_GREEN, "  Working tree clean."))
+
+    if mode == "discard":
+        remote_script = f"""
+set -e
+cd {path_q}
+echo "Discard: git reset --hard HEAD"
+git reset --hard HEAD
+{pull_snip}
+"""
+    elif mode == "keep":
+        remote_script = _git_pull_keep_script(path_q, pull_snip, keep_paths)
+    else:
+        remote_script = f"""
+set -e
+cd {path_q}
+{pull_snip}
+"""
+
     if not _pause("Press Enter to run…"):
         return
     try:
         code, out, used_sudo = ssh_remote_capture_sudo_fallback(
-            server, remote_script, timeout=180.0, always_retry=True
+            server, remote_script, timeout=300.0, always_retry=True
         )
     except KeyboardInterrupt:
         print(f"\n{_CANCEL_HINT}")
         return
-    _print_git_pull_output(out)
+    _print_git_pull_output(_ssh_out_payload(out))
     if used_sudo:
         print("  used: sudo -S")
     print(f"Exit: {code}")
@@ -2449,8 +2852,10 @@ def host_actions_menu(
     is_git: Optional[bool] = None
     has_vendor: Optional[bool] = None
     detected = False
+    core._curses_blocking_input(stdscr)
 
     while True:
+        core._curses_blocking_input(stdscr)
         for s in core.load_servers(config_path):
             if s.name == server.name:
                 server = s
@@ -2637,7 +3042,7 @@ def host_actions_menu(
             core._safe_add(stdscr, y, 0, (prefix + label)[: max(0, w - 1)], attr)
 
         stdscr.refresh()
-        key = stdscr.getch()
+        key = _getch_blocking(stdscr)
         if key in (curses.KEY_UP, ord("k")):
             focus = (focus - 1) % len(selectable)
         elif key in (curses.KEY_DOWN, ord("j")):
@@ -2654,7 +3059,7 @@ def host_actions_menu(
             if action == "git_pull":
                 _suspend_curses(stdscr)
                 try:
-                    action_git_pull(server)
+                    action_git_pull(server, stdscr=stdscr)
                 finally:
                     _resume_curses(stdscr)
                 status = "Git pull finished."
