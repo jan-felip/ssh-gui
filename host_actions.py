@@ -113,13 +113,19 @@ def _c(code: str, text: str) -> str:
 
 
 def _colorize_git_pull_line(line: str) -> str:
-    """Green add, red delete, yellow modify; everything else yellow."""
+    """
+    Diff colors: + / +++ always green; - / --- always red (never yellow).
+    New-file paths/text green; modified paths/text yellow.
+    """
     s = line.rstrip("\n")
     stripped = s.lstrip()
     low = stripped.lower()
 
-    if stripped.startswith("+++") or stripped.startswith("---"):
-        return _c(_ANSI_YELLOW, s)
+    # +++ / --- headers and hunk +/- lines — symbol color wins over “modified”
+    if stripped.startswith("+++"):
+        return _c(_ANSI_GREEN, s)
+    if stripped.startswith("---"):
+        return _c(_ANSI_RED, s)
     if stripped.startswith("+"):
         return _c(_ANSI_GREEN, s)
     if stripped.startswith("-"):
@@ -135,6 +141,7 @@ def _colorize_git_pull_line(line: str) -> str:
         marks = m.group(1)
         has_plus = "+" in marks
         has_minus = "-" in marks
+        # Pure adds → new file (green path); pure deletes → red; both → modified yellow
         if has_plus and not has_minus:
             return _c(_ANSI_GREEN, s)
         if has_minus and not has_plus:
@@ -146,6 +153,7 @@ def _colorize_git_pull_line(line: str) -> str:
     if "deletion" in low and "insertion" not in low:
         return _c(_ANSI_RED, s)
 
+    # Modified / other status text (paths, "Updating …", etc.)
     return _c(_ANSI_YELLOW, s)
 
 
@@ -1711,6 +1719,27 @@ chmod 600 {conf_q}
 """
 
 
+# Walker list — Drupal bin caches (TRUNCATE, not DROP).
+_MYSQL_CACHE_TRUNCATE_TABLES: Tuple[str, ...] = (
+    "cachetags",
+    "cache_access_policy",
+    "cache_bootstrap",
+    "cache_config",
+    "cache_container",
+    "cache_data",
+    "cache_default",
+    "cache_discovery",
+    "cache_dynamic_page_cache",
+    "cache_entity",
+    "cache_file_parsing",
+    "cache_menu",
+    "cache_page",
+    "cache_render",
+    "cache_routes",
+    "cache_toolbar",
+)
+
+
 def action_db_export_drush(
     server: core.Server,
     *,
@@ -2128,6 +2157,89 @@ rm -f {conf_q} {remote_q}
         return server
 
     _print_success_line("[success] MySQL import finished.")
+    server = _maybe_persist_mysql_creds(server, creds, config_path)
+    print()
+    _pause()
+    return server
+
+
+def action_mysql_clear_cache(
+    server: core.Server,
+    *,
+    config_path: Optional[Path] = None,
+    has_vendor: bool = False,
+) -> core.Server:
+    """
+    TRUNCATE Walker’s Drupal cache table list via non-interactive mysql
+    (defaults-extra-file). Creds: Drush → YAML → prompt (same as export/import).
+    """
+    tables = _MYSQL_CACHE_TRUNCATE_TABLES
+    _print_info_panel(
+        "MySQL: Clear cache",
+        [
+            f"host:    {server.label}",
+            f"tables:  {len(tables)} (cachetags + cache_*)",
+            "cmd:     mysql --defaults-extra-file … -e 'TRUNCATE …'",
+            "creds:   Drush → YAML → prompt (optional save after success)",
+            "confirm: y to run · Enter/N cancels",
+        ],
+    )
+    print(_c(_ANSI_CYAN_DIM, "  Tables:"))
+    for t in tables:
+        print(_c(_ANSI_CYAN_DIM, f"    · {t}"))
+    print()
+    if not _confirm_yn("TRUNCATE listed cache tables on remote MySQL?", default_yes=False):
+        return server
+
+    server, creds = resolve_mysql_creds(
+        server, config_path=config_path, has_vendor=has_vendor
+    )
+    if not creds:
+        _pause()
+        return server
+
+    stamp = _dump_stamp()
+    conf_path = f"/tmp/ssh-gui-my-cc-{_safe_dump_stem(server.name)}-{stamp}.cnf"
+    conf_q = shlex.quote(conf_path)
+    db_q = shlex.quote(creds["database"])
+    # One statement list; identifiers backtick-escaped (names are fixed constants).
+    sql = "; ".join(f"TRUNCATE `{t}`" for t in tables) + ";"
+    sql_q = shlex.quote(sql)
+    script = _mysql_defaults_file_remote_script(creds, conf_path) + f"""
+set -e
+mysql --defaults-extra-file={conf_q} --batch --raw {db_q} -e {sql_q}
+rm -f {conf_q}
+"""
+    print()
+    try:
+        code, out, used_sudo = ssh_remote_capture_sudo_fallback(
+            server, script, timeout=120.0, always_retry=True
+        )
+    except KeyboardInterrupt:
+        print(f"\n{_CANCEL_HINT}")
+        ssh_remote_capture(server, f"rm -f {conf_q}", timeout=15.0)
+        return server
+
+    ssh_remote_capture(server, f"rm -f {conf_q}", timeout=15.0)
+
+    if code != 0:
+        safe_out = re.sub(r"(?i)password\s*=\s*.*", "password=***", out or "")
+        _print_error_panel(
+            "MySQL clear cache failed",
+            [
+                f"host: {server.label}",
+                f"db: {creds['database']}",
+                f"exit: {code}",
+                f"sudo: {used_sudo}",
+            ],
+            safe_out,
+        )
+        _pause()
+        return server
+
+    _print_success_line(
+        f"[success] Truncated {len(tables)} cache table(s) on {creds['database']}"
+    )
     server = _maybe_persist_mysql_creds(server, creds, config_path)
     print()
     _pause()
@@ -2715,6 +2827,8 @@ cd {path_q}
 {pull_snip}
 """
 
+    # Blank after clean/dirty status before confirm wait
+    print()
     if not _pause("Press Enter to run…"):
         return
     try:
@@ -2942,6 +3056,7 @@ def host_actions_menu(
         if has_remote:
             can_db_xfer = bool(has_local)
             mysql_actions = [
+                ("mysql_clear_cache", "Clear cache", True),
                 (
                     "mysql_db_export",
                     "Database: Export"
@@ -3178,6 +3293,17 @@ def host_actions_menu(
                 finally:
                     _resume_curses(stdscr)
                 status = "Config export finished."
+            elif action == "mysql_clear_cache":
+                _suspend_curses(stdscr)
+                try:
+                    server = action_mysql_clear_cache(
+                        server,
+                        config_path=config_path,
+                        has_vendor=bool(has_vendor),
+                    )
+                finally:
+                    _resume_curses(stdscr)
+                status = "MySQL: Clear cache finished."
             elif action == "mysql_db_export":
                 _suspend_curses(stdscr)
                 try:
