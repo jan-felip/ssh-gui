@@ -9,6 +9,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import termios
@@ -17,7 +18,7 @@ import urllib.parse
 from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional, TextIO, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Optional, TextIO, Tuple
 
 import ssh_gui as core
 
@@ -765,6 +766,23 @@ def _rsync_progress_flags() -> List[str]:
     return ["--progress", "-h"]
 
 
+def _rsync_term_width() -> int:
+    try:
+        return max(48, shutil.get_terminal_size((80, 24)).columns)
+    except OSError:
+        return 80
+
+
+def _rsync_clip(text: str, width: int) -> str:
+    if width <= 0:
+        return ""
+    if len(text) <= width:
+        return text
+    if width == 1:
+        return "…"
+    return "…" + text[-(width - 1) :]
+
+
 def _colorize_rsync_name_line(line: str) -> str:
     s = line.rstrip("\n")
     stripped = s.lstrip()
@@ -788,25 +806,6 @@ def _colorize_rsync_name_line(line: str) -> str:
     return _c(_ANSI_GREEN, s)
 
 
-def _format_rsync_progress_line(
-    *,
-    name: str,
-    pct: int,
-    rate: str,
-    eta: str,
-    extra: str = "",
-) -> str:
-    bar = _progress_bar(pct)
-    name_w = 34
-    shown = name if len(name) <= name_w else ("…" + name[-(name_w - 1) :])
-    pct_s = f"{pct:3d}%"
-    rate_s = f"{rate:>9}"
-    eta_s = f"{eta:>8}"
-    tail = f"  {extra}" if extra else ""
-    body = f"  {shown:<{name_w}}  [{bar}]  {pct_s}  {rate_s}  {eta_s}{tail}"
-    return _c(_ANSI_CYAN, body)
-
-
 def _iter_rsync_output_chunks(stream: TextIO) -> Iterator[str]:
     """Yield text chunks split on CR/LF (rsync progress rewrites with \\r)."""
     buf = ""
@@ -817,6 +816,27 @@ def _iter_rsync_output_chunks(stream: TextIO) -> Iterator[str]:
                 yield buf
             break
         buf += block
+        while True:
+            m = re.search(r"[\r\n]", buf)
+            if not m:
+                break
+            part, buf = buf[: m.start()], buf[m.end() :]
+            if part:
+                yield part
+
+
+def _iter_rsync_read_chunks(read_fn: Callable[[], bytes]) -> Iterator[str]:
+    """Like _iter_rsync_output_chunks but for a bytes read() callback (PTY)."""
+    buf = ""
+    while True:
+        raw = read_fn()
+        if raw is None:
+            if buf:
+                yield buf
+            break
+        if not raw:
+            continue
+        buf += raw.decode("utf-8", errors="replace")
         while True:
             m = re.search(r"[\r\n]", buf)
             if not m:
@@ -839,27 +859,190 @@ def _rsync_is_meta_line(line: str) -> bool:
     )
 
 
-def run_rsync_pretty(argv: List[str], server: core.Server) -> int:
-    """
-    Run rsync with colored file lines + aligned percent progress bar.
-    Password hosts keep PTY auto-auth (raw progress); key hosts get live polish.
-    """
-    if core.uses_yaml_password(server):
-        print(_c(_ANSI_CYAN_DIM, "  progress: live (PTY) — password host"))
-        return run_argv(argv, server, interactive=True)
+def _rsync_is_progress_line(line: str) -> Optional[re.Match]:
+    return _RSYNC_PROGRESS_RE.match(line) or _RSYNC_PROGRESS2_RE.match(line)
 
-    print()
-    print(_c(_ANSI_CYAN, "-" * 56))
-    print(
-        _c(
-            _ANSI_CYAN_DIM,
-            "  path                               progress                   %     rate      eta",
-        )
+
+def _rsync_parse_progress(
+    m: re.Match,
+    *,
+    direction: str = "upload",
+) -> Tuple[int, str, str, str, int]:
+    """
+    Return (bar_pct, rate, eta, files_extra, file_pct).
+
+    bar_pct uses overall to-check when present, else per-file %.
+    direction:
+      upload   → fill 0→100 (done/total)
+      download → shrink 100→0 (left/total) — sense Walker likes for prod→local
+    """
+    file_pct = int(m.group(2))
+    rate = m.group(3)
+    eta = m.group(4)
+    extra = ""
+    # Default from per-file % until/unless to-check is available
+    if direction == "download":
+        bar_pct = 100 - file_pct
+    else:
+        bar_pct = file_pct
+    if m.lastindex and m.lastindex >= 5 and m.group(5):
+        raw_extra = m.group(5)
+        tc = _RSYNC_TO_CHECK_RE.search(raw_extra)
+        if tc:
+            left = int(tc.group(1))
+            total = int(tc.group(2))
+            done = max(0, total - left)
+            if total > 0:
+                if direction == "download":
+                    bar_pct = int(round(100.0 * left / total))
+                else:
+                    bar_pct = int(round(100.0 * done / total))
+            extra = f"{done}/{total}"
+        else:
+            extra = raw_extra.strip()
+    bar_pct = max(0, min(100, int(bar_pct)))
+    return bar_pct, rate, eta, extra, file_pct
+
+
+def _rsync_hud_lines(
+    *,
+    pct: int,
+    rate: str,
+    eta: str,
+    extra: str,
+    filename: str,
+    width: int,
+) -> Tuple[str, str]:
+    """Two fixed HUD lines: overall bar+rate, then current file."""
+    bar_w = min(28, max(12, width // 4))
+    bar = _progress_bar(pct, bar_w)
+    rate_s = rate or "—"
+    eta_s = eta or "—"
+    prog = f"  [{bar}]  {pct:3d}%   {rate_s:>9}   eta {eta_s}"
+    if extra:
+        prog += f"   {extra}"
+    line1 = _c(_ANSI_CYAN, _rsync_clip(prog, width - 1))
+    name = filename.strip() if filename.strip() else "…"
+    file_plain = f"  file: {name}"
+    line2 = _c(_ANSI_GREEN, _rsync_clip(file_plain, width - 1))
+    return line1, line2
+
+
+def _rsync_hud_draw(
+    state: Dict[str, Any],
+    *,
+    pct: int,
+    rate: str,
+    eta: str,
+    extra: str,
+    filename: str,
+) -> None:
+    """Draw/update the fixed 2-line HUD in place (no scroll)."""
+    width = _rsync_term_width()
+    line1, line2 = _rsync_hud_lines(
+        pct=pct, rate=rate, eta=eta, extra=extra, filename=filename, width=width
     )
-    print(_c(_ANSI_CYAN, "-" * 56))
+    if not state.get("drawn"):
+        sys.stdout.write(line1 + "\n" + line2 + "\n")
+        sys.stdout.flush()
+        state["drawn"] = True
+        return
+    # Move to start of HUD (2 lines up), clear each line, rewrite.
+    sys.stdout.write("\033[2A")
+    sys.stdout.write("\r\033[K" + line1 + "\n")
+    sys.stdout.write("\r\033[K" + line2 + "\n")
+    sys.stdout.flush()
 
+
+def _drive_rsync_hud(
+    chunks: Iterator[str],
+    *,
+    direction: str = "upload",
+) -> List[str]:
+    """
+    Consume rsync output: keep a fixed progress bar + one current-file line.
+    Returns trailing meta lines (sent/total/speedup) for the footer.
+    """
+    state: Dict[str, Any] = {"drawn": False}
     current_name = ""
-    on_progress_row = False
+    # Download starts "full" (remaining); upload starts empty (filling)
+    pct = 100 if direction == "download" else 0
+    rate, eta, extra = "—", "—", ""
+    meta_tail: List[str] = []
+    saw_progress = False
+    # Seed empty HUD so the UI is visible before first progress tick
+    _rsync_hud_draw(
+        state, pct=pct, rate=rate, eta=eta, extra=extra, filename=current_name
+    )
+
+    for chunk in chunks:
+        line = chunk.rstrip()
+        if not line.strip():
+            continue
+        m = _rsync_is_progress_line(line)
+        if m:
+            pct, rate, eta, extra, _file_pct = _rsync_parse_progress(
+                m, direction=direction
+            )
+            saw_progress = True
+            _rsync_hud_draw(
+                state,
+                pct=pct,
+                rate=rate,
+                eta=eta,
+                extra=extra,
+                filename=current_name,
+            )
+            continue
+
+        stripped = line.strip()
+        if _rsync_is_meta_line(stripped):
+            # Keep summary for after HUD; ignore list-building chatter mid-run
+            low = stripped.lower()
+            if (
+                low.startswith("sent ")
+                or low.startswith("total size")
+                or "speedup" in low
+            ):
+                meta_tail.append(stripped)
+            continue
+
+        # Itemize / verbose path → update file line only (no scroll)
+        # Strip itemize prefixes like >f.st...... when present
+        name = stripped
+        if re.match(r"^[<>ch\*].{9}\s+", stripped):
+            name = stripped[11:].lstrip() or stripped
+        elif stripped.startswith("*deleting "):
+            name = stripped
+        current_name = name
+        _rsync_hud_draw(
+            state,
+            pct=pct,
+            rate=rate,
+            eta=eta,
+            extra=extra,
+            filename=current_name,
+        )
+
+    # Final paint: upload ends full; download ends empty
+    if state.get("drawn") and saw_progress:
+        final_pct = 0 if direction == "download" else 100
+        _rsync_hud_draw(
+            state,
+            pct=final_pct,
+            rate=rate,
+            eta=eta or "0:00:00",
+            extra=extra,
+            filename=current_name or "done",
+        )
+    return meta_tail
+
+
+def _run_rsync_pretty_pipe(
+    argv: List[str],
+    *,
+    direction: str = "upload",
+) -> Tuple[int, List[str]]:
     try:
         proc = subprocess.Popen(
             argv,
@@ -870,49 +1053,12 @@ def run_rsync_pretty(argv: List[str], server: core.Server) -> int:
         )
     except OSError as exc:
         print(_c(_ANSI_RED, f"  failed to start rsync: {exc}"))
-        return 127
-
+        return 127, []
     assert proc.stdout is not None
     try:
-        for chunk in _iter_rsync_output_chunks(proc.stdout):
-            line = chunk.rstrip()
-            if not line.strip():
-                continue
-            m = _RSYNC_PROGRESS_RE.match(line) or _RSYNC_PROGRESS2_RE.match(line)
-            if m:
-                pct = int(m.group(2))
-                rate = m.group(3)
-                eta = m.group(4)
-                extra = ""
-                if m.lastindex and m.lastindex >= 5 and m.group(5):
-                    extra = m.group(5)
-                    tc = _RSYNC_TO_CHECK_RE.search(extra)
-                    if tc:
-                        done = int(tc.group(2)) - int(tc.group(1))
-                        total = int(tc.group(2))
-                        extra = f"{done}/{total}"
-                label = current_name or "transfer"
-                rendered = _format_rsync_progress_line(
-                    name=label, pct=pct, rate=rate, eta=eta, extra=extra
-                )
-                sys.stdout.write("\r\033[K" + rendered)
-                sys.stdout.flush()
-                on_progress_row = True
-                if pct >= 100:
-                    sys.stdout.write("\n")
-                    sys.stdout.flush()
-                    on_progress_row = False
-                    current_name = ""
-                continue
-
-            if on_progress_row:
-                sys.stdout.write("\n")
-                sys.stdout.flush()
-                on_progress_row = False
-            stripped = line.strip()
-            if not _rsync_is_meta_line(stripped):
-                current_name = stripped
-            print(_colorize_rsync_name_line(line))
+        meta = _drive_rsync_hud(
+            _iter_rsync_output_chunks(proc.stdout), direction=direction
+        )
         code = proc.wait()
     except KeyboardInterrupt:
         try:
@@ -927,12 +1073,140 @@ def run_rsync_pretty(argv: List[str], server: core.Server) -> int:
             except OSError:
                 pass
         raise
+    return code, meta
 
-    if on_progress_row:
-        sys.stdout.write("\n")
-        sys.stdout.flush()
+
+def _run_rsync_pretty_pty(
+    argv: List[str],
+    password: str,
+    *,
+    direction: str = "upload",
+) -> Tuple[int, List[str]]:
+    """Password hosts: PTY for SSH auth, same fixed HUD as pipe mode."""
+    import errno
+    import pty
+    import select
+    import signal
+
+    pid, master = pty.fork()
+    if pid == 0:
+        try:
+            os.execvp(argv[0], argv)
+        except OSError:
+            os._exit(127)
+
+    auth_buf = b""
+    password_sent = False
+    closed = False
+    child_status: Optional[int] = None
+
+    def read_fn() -> Optional[bytes]:
+        nonlocal auth_buf, password_sent, closed, child_status
+        if closed:
+            return None
+        try:
+            exited, status = os.waitpid(pid, os.WNOHANG)
+        except ChildProcessError:
+            closed = True
+            return None
+        if exited == pid:
+            child_status = status
+            leftover = _drain_pty(master)
+            closed = True
+            return leftover if leftover else None
+
+        r, _, _ = select.select([master], [], [], 0.2)
+        if not r:
+            return b""
+        try:
+            data = os.read(master, 4096)
+        except OSError as exc:
+            if exc.errno == errno.EIO:
+                closed = True
+                return None
+            raise
+        if not data:
+            closed = True
+            return None
+
+        auth_buf += data
+        if len(auth_buf) > 8192:
+            auth_buf = auth_buf[-4096:]
+        if not password_sent and core._HOSTKEY_RE.search(auth_buf):
+            os.write(master, b"yes\n")
+            auth_buf = b""
+        elif not password_sent and core._PASSWORD_RE.search(auth_buf):
+            os.write(
+                master,
+                password.encode("utf-8", errors="surrogateescape") + b"\n",
+            )
+            password_sent = True
+            auth_buf = b""
+        return data
+
+    meta: List[str] = []
+    try:
+        meta = _drive_rsync_hud(
+            _iter_rsync_read_chunks(read_fn), direction=direction
+        )
+    except KeyboardInterrupt:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            pass
+        raise
+    finally:
+        try:
+            os.close(master)
+        except OSError:
+            pass
+
+    if child_status is None:
+        try:
+            _exited, child_status = os.waitpid(pid, 0)
+        except ChildProcessError:
+            return 1, meta
+    return _exit_status_code(child_status), meta
+
+
+def run_rsync_pretty(
+    argv: List[str],
+    server: core.Server,
+    *,
+    direction: str = "upload",
+) -> int:
+    """
+    Run rsync with a fixed 2-line HUD: overall progress bar (+ rate/eta) and
+    one current-file line updated in place (no per-file scroll dump).
+    Password hosts use PTY auth with the same HUD.
+
+    direction: "upload" fills the bar; "download" shrinks it (prod→local).
+    """
+    if direction not in ("upload", "download"):
+        direction = "upload"
+    print()
     print(_c(_ANSI_CYAN, "-" * 56))
+    print(_c(_ANSI_CYAN_DIM, "  overall progress (bar + rate) · current file on line below"))
+    print(_c(_ANSI_CYAN, "-" * 56))
+
+    meta: List[str] = []
+    try:
+        if core.uses_yaml_password(server):
+            assert server.password is not None
+            code, meta = _run_rsync_pretty_pty(
+                argv, server.password, direction=direction
+            )
+        else:
+            code, meta = _run_rsync_pretty_pipe(argv, direction=direction)
+    except KeyboardInterrupt:
+        print(f"\n{_CANCEL_HINT}")
+        raise
+
+    print(_c(_ANSI_CYAN, "-" * 56))
+    for line in meta:
+        print(_colorize_rsync_name_line(line))
     if code == 0:
+        print()  # blank row above success
         _print_success_line("[success] rsync finished")
     else:
         print(_c(_ANSI_RED, f"  rsync exit: {code}"))
@@ -949,7 +1223,9 @@ def _rsync_file(
     """rsync a single file (src/dest may be local paths or user@host:path)."""
     ssh_e = "ssh " + " ".join(shlex.quote(o) for o in _ssh_opts(server))
     argv = ["rsync", "-avz", *_rsync_progress_flags(), "-e", ssh_e, src, dest]
-    return run_rsync_pretty(argv, server)
+    # Heuristic: remote in src → download; remote in dest → upload
+    direction = "download" if "@" in src.split(":", 1)[0] else "upload"
+    return run_rsync_pretty(argv, server, direction=direction)
 
 
 def _exec_vendor_shell(
@@ -2399,7 +2675,7 @@ def action_rsync_upload(server: core.Server) -> None:
     if not _confirm_yn("Run upload rsync+chmod?", default_yes=False):
         return
     try:
-        code = run_rsync_pretty(argv, server)
+        code = run_rsync_pretty(argv, server, direction="upload")
     except KeyboardInterrupt:
         print(f"\n{_CANCEL_HINT}")
         return
@@ -2855,19 +3131,181 @@ def _colorize_git_log_line(line: str) -> str:
     return _c(_ANSI_YELLOW, s)
 
 
+def _parse_git_log_rows(out: str) -> List[Dict[str, str]]:
+    """
+    Parse `git log --pretty=format:%h%x09%H%x09%ad%x09%an%x09%s` rows.
+    Returns list of {short, full, date, author, subject}.
+    """
+    rows: List[Dict[str, str]] = []
+    for raw in (out or "").splitlines():
+        line = raw.strip()
+        if not line or "password:" in line.lower():
+            continue
+        parts = line.split("\t")
+        if len(parts) < 5:
+            # Fallback: "%h %ad %an %s" style (space-separated hash first)
+            m = re.match(
+                r"^([0-9a-f]{7,40})\s+(\S+)\s+(\S+)\s+(.*)$",
+                line,
+                re.IGNORECASE,
+            )
+            if not m:
+                continue
+            rows.append(
+                {
+                    "short": m.group(1),
+                    "full": m.group(1),
+                    "date": m.group(2),
+                    "author": m.group(3),
+                    "subject": m.group(4),
+                }
+            )
+            continue
+        rows.append(
+            {
+                "short": parts[0].strip(),
+                "full": parts[1].strip(),
+                "date": parts[2].strip(),
+                "author": parts[3].strip(),
+                "subject": "\t".join(parts[4:]).strip(),
+            }
+        )
+    return rows
+
+
+def _confirm_type_token(prompt: str, expected: str) -> bool:
+    """Second confirmation: user must type `expected` exactly (case-insensitive for hashes)."""
+    try:
+        ans = input(prompt).strip()
+    except (EOFError, KeyboardInterrupt):
+        print(f"\n{_CANCEL_HINT}")
+        return False
+    return ans.lower() == expected.lower()
+
+
+def action_git_restore_commit(
+    server: core.Server,
+    *,
+    path: str,
+    commit_short: str,
+    commit_full: str,
+    subject: str,
+) -> None:
+    """
+    Restore remote site to an old commit for deploy rollback.
+    Creates a local backup branch, then `git reset --hard <commit>`.
+    Double confirm: y/N, then type the short hash. Never pushes.
+    """
+    path_q = shlex.quote(path)
+    full_q = shlex.quote(commit_full)
+    _print_info_panel(
+        "Restore commit (rollback)",
+        [
+            f"host:     {server.label}",
+            f"path:     {path}",
+            f"commit:   {commit_short}  {subject}",
+            "action:   git branch ssh-gui-backup-…  then  git reset --hard <commit>",
+            "effect:   moves branch tip; working tree matches that commit",
+            "safety:   backup branch kept on remote (no push)",
+            "warn:     discards uncommitted local changes on the remote tree",
+        ],
+    )
+    print(
+        _c(
+            _ANSI_YELLOW,
+            "  This is a hard rollback on the remote deploy tree. Later commits stay",
+        )
+    )
+    print(
+        _c(
+            _ANSI_YELLOW,
+            "  reachable via the backup branch / reflog until pruned — nothing is pushed.",
+        )
+    )
+    print()
+    # Confirm 1 — explicit y/N (default no)
+    if not _confirm_yn(
+        f"Confirm 1/2 — reset --hard to {commit_short}?",
+        default_yes=False,
+    ):
+        print(_c(_ANSI_YELLOW, "  Cancelled — nothing changed."))
+        return
+    # Confirm 2 — must type the short hash (not a second accidental 'y')
+    print()
+    print(
+        _c(
+            _ANSI_YELLOW,
+            f"  Confirm 2/2 — type the commit hash exactly to proceed: {commit_short}",
+        )
+    )
+    if not _confirm_type_token("  Hash: ", commit_short):
+        print(_c(_ANSI_YELLOW, "  Hash mismatch — cancelled. Nothing changed."))
+        return
+
+    script = f"""
+set -e
+cd {path_q}
+BEFORE=$(git rev-parse --short HEAD)
+BEFORE_FULL=$(git rev-parse HEAD)
+TARGET=$(git rev-parse --verify {full_q})
+STAMP=$(date +%Y%m%d-%H%M%S)
+BACKUP="ssh-gui-backup-${{BEFORE}}-${{STAMP}}"
+echo "HEAD before: $BEFORE_FULL"
+echo "Backup branch: $BACKUP"
+git branch "$BACKUP"
+echo "Reset --hard -> {commit_short}"
+git reset --hard "$TARGET"
+echo "HEAD after:  $(git rev-parse HEAD)"
+git log -1 --oneline --decorate
+git status -sb
+"""
+    print()
+    try:
+        code, out, used_sudo = ssh_remote_capture_sudo_fallback(
+            server, script, timeout=120.0, always_retry=True
+        )
+    except KeyboardInterrupt:
+        print(f"\n{_CANCEL_HINT}")
+        return
+    text = _ssh_out_payload(out)
+    if text.strip():
+        for line in text.splitlines():
+            print(_c(_ANSI_CYAN_DIM, f"  {line}"))
+    if used_sudo:
+        print(_c(_ANSI_CYAN_DIM, "  used: sudo -S"))
+    if code == 0:
+        _print_success_line(
+            f"[success] Restored to {commit_short} (backup branch created on remote)"
+        )
+    else:
+        _print_error_panel(
+            "Restore failed",
+            [f"host: {server.label}", f"commit: {commit_short}", f"exit: {code}"],
+            text,
+        )
+
+
 def action_commit_history(server: core.Server, limit: int = 20) -> None:
+    """
+    Show recent commits; optional restore (reset --hard) with double confirmation.
+    """
     if not server.web_remote:
         return
     path = normalize_remote_path(server.web_remote)
     path_q = shlex.quote(path)
-    fmt = shlex.quote("%h %ad %an %s")
-    cmd = f"git -C {path_q} log -n {int(limit)} --date=short --pretty=format:{fmt}"
+    # Tab-separated so we can parse hash/date/author/subject reliably
+    fmt = "%h%x09%H%x09%ad%x09%an%x09%s"
+    fmt_q = shlex.quote(fmt)
+    cmd = (
+        f"git -C {path_q} log -n {int(limit)} --date=short --pretty=format:{fmt_q}"
+    )
     _print_info_panel(
         "Git history",
         [
             f"host:  {server.label}",
             f"path:  {path}",
             f"cmd:   git log -n {limit} --pretty=…",
+            "next:  pick a number to restore that commit (reset --hard), or leave blank",
             "note:  non-sudo first; sudo -S fallback if password in YAML",
             _RUN_KEYS_NOTE,
         ],
@@ -2882,12 +3320,8 @@ def action_commit_history(server: core.Server, limit: int = 20) -> None:
     except KeyboardInterrupt:
         print(f"\n{_CANCEL_HINT}")
         return
-    text = (out or "").rstrip()
-    if text:
-        for line in text.splitlines():
-            print(_colorize_git_log_line(line))
-    elif code == 0:
-        print(_c(_ANSI_YELLOW, "(no commits)"))
+    payload = _ssh_out_payload(out)
+    rows = _parse_git_log_rows(payload)
     if code != 0:
         _print_error_panel(
             "Git history failed",
@@ -2896,11 +3330,59 @@ def action_commit_history(server: core.Server, limit: int = 20) -> None:
                 f"path: {path}",
                 f"exit: {code}",
             ],
-            out,
+            payload,
         )
-    elif used_sudo:
+        _pause()
+        return
+    if not rows:
+        print(_c(_ANSI_YELLOW, "(no commits)"))
+        print()
+        _pause()
+        return
+
+    print(_c(_ANSI_CYAN, "-" * 56))
+    for i, row in enumerate(rows, start=1):
+        label = f"{row['short']}  {row['date']}  {row['author']}  {row['subject']}"
+        num = f"{i:2d}."
+        print(f"  {_c(_ANSI_CYAN_DIM, num)} {_colorize_git_log_line(label)}")
+    print(_c(_ANSI_CYAN, "-" * 56))
+    if used_sudo:
         print(_c(_ANSI_CYAN_DIM, "  used: sudo -S"))
-    print()  # blank before bottom Enter
+    print()
+    print(
+        _c(
+            _ANSI_CYAN_DIM,
+            "  Restore: enter commit number · Enter / q leaves without changes",
+        )
+    )
+    try:
+        choice = input("  # ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print(f"\n{_CANCEL_HINT}")
+        _pause()
+        return
+    if not choice or choice in ("q", "quit"):
+        _pause()
+        return
+    if not choice.isdigit():
+        print(_c(_ANSI_YELLOW, "  Not a number — cancelled."))
+        _pause()
+        return
+    idx = int(choice)
+    if idx < 1 or idx > len(rows):
+        print(_c(_ANSI_YELLOW, "  Out of range — cancelled."))
+        _pause()
+        return
+    row = rows[idx - 1]
+    print()
+    action_git_restore_commit(
+        server,
+        path=path,
+        commit_short=row["short"],
+        commit_full=row["full"],
+        subject=row["subject"],
+    )
+    print()
     _pause()
 
 
@@ -2944,7 +3426,7 @@ def action_rsync_download(server: core.Server) -> None:
     if not _confirm_yn("Run download rsync?", default_yes=False):
         return
     try:
-        run_rsync_pretty(argv, server)
+        run_rsync_pretty(argv, server, direction="download")
     except KeyboardInterrupt:
         print(f"\n{_CANCEL_HINT}")
         return
